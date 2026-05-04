@@ -181,6 +181,66 @@ def init_db():
             # trigger a phantom cross from a price the alert never observed live.
             cursor.execute("UPDATE alerts SET last_value = NULL WHERE status = 'active'")
 
+            # Manually-entered option positions for P&L tracking + chart overlay.
+            # qty is signed: positive = long, negative = short. side is 'CALL' or 'PUT'.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    qty INTEGER NOT NULL,
+                    strike REAL NOT NULL,
+                    expiry TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    label TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    opened_at INTEGER NOT NULL,
+                    closed_at INTEGER
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_active ON positions(ticker, status)')
+
+            # Multi-profile UI settings. payload_json is the same shape that
+            # /save_settings used to write to settings.json. profile_name is the
+            # user-chosen handle (e.g. "0DTE SPX"); 'default' is the back-compat slot.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    profile_name TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            ''')
+
+            # Watchlist — tickers the user wants tracked alongside the active one.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL UNIQUE,
+                    label TEXT,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+            ''')
+
+            # End-of-day session reports. One row per (date, ticker). summary_json
+            # stores the full computed report; the columns mirror its key fields
+            # so they're queryable directly without parsing JSON.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS session_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    peak_gex_strike REAL,
+                    peak_gex_value REAL,
+                    em_accuracy_pct REAL,
+                    centroid_drift REAL,
+                    summary_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(date, ticker)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_session_reports_date ON session_reports(date)')
+
             conn.commit()
 
 def is_market_hours():
@@ -235,10 +295,46 @@ def resolve_level_value_column(level_type):
     return normalized_type
 
 
-def combine_level_values(level_type, call_value, put_value):
+# Request-scoped GEX sign convention. Set at the top of each /update* request
+# from the payload's `gex_sign` field; chart builders read it via _get_gex_sign()
+# without needing to thread an explicit kwarg through every signature.
+_request_ctx = threading.local()
+
+VALID_GEX_SIGNS = ('dealer', 'raw')
+
+
+def _set_gex_sign(sign):
+    _request_ctx.gex_sign = sign if sign in VALID_GEX_SIGNS else 'dealer'
+
+
+def _get_gex_sign():
+    return getattr(_request_ctx, 'gex_sign', 'dealer')
+
+
+def gex_net(call_value, put_value, sign=None):
+    """Compute the signed net-GEX value at a strike under the chosen convention.
+
+    sign='dealer' (default): put − call. Positive = dealers long gamma at that
+        strike (assumes customers buy calls / sell puts). Matches SqueezeMetrics
+        and SpotGamma — use this if you want "Long Gamma" / "Short Gamma" labels
+        to align with industry tools.
+
+    sign='raw': call − put. Positive = call OI/gamma is the heavier side at this
+        strike. Direction-agnostic concentration view, no dealer assumption.
+
+    sign=None: read from request-scoped context (set per-request via _set_gex_sign).
+    """
+    if sign is None:
+        sign = _get_gex_sign()
+    if sign == 'raw':
+        return call_value - put_value
+    return put_value - call_value
+
+
+def combine_level_values(level_type, call_value, put_value, gex_sign=None):
     normalized_type = normalize_level_type(level_type)
     if normalized_type == 'GEX':
-        return call_value - put_value
+        return gex_net(call_value, put_value, sign=gex_sign)
     if normalized_type == 'AbsGEX':
         return abs(call_value) + abs(put_value)
     if normalized_type == 'Volume':
@@ -753,7 +849,312 @@ current_expiry = None
 
 # Cache for last fetched options data per ticker — used by /update_price
 # so the price chart can refresh independently without re-fetching the full chain.
-_options_cache = {}  # (ticker, expiry_key) -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
+class _BoundedTTLCache:
+    """LRU + TTL cache with hit/miss counters. Drop-in dict interface for the
+    handful of operations the codebase uses ([], .get, .items, .__contains__)."""
+
+    def __init__(self, maxsize=32, ttl_seconds=60):
+        from collections import OrderedDict
+        self._store = OrderedDict()  # key -> (value, inserted_at)
+        self._lock = threading.Lock()
+        self._maxsize = int(maxsize)
+        self._ttl = float(ttl_seconds)
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def _expired(self, ts):
+        return self._ttl > 0 and (time.time() - ts) > self._ttl
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = (value, time.time())
+            while len(self._store) > self._maxsize:
+                self._store.popitem(last=False)
+                self.evictions += 1
+
+    def __contains__(self, key):
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return False
+            if self._expired(entry[1]):
+                del self._store[key]
+                return False
+            return True
+
+    def get(self, key, default=None):
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                self.misses += 1
+                return default
+            value, ts = entry
+            if self._expired(ts):
+                del self._store[key]
+                self.misses += 1
+                return default
+            self._store.move_to_end(key)
+            self.hits += 1
+            return value
+
+    def items(self):
+        with self._lock:
+            now = time.time()
+            return [
+                (k, v) for k, (v, ts) in list(self._store.items())
+                if not self._ttl or (now - ts) <= self._ttl
+            ]
+
+    def stats(self):
+        with self._lock:
+            return {
+                'size': len(self._store),
+                'max_size': self._maxsize,
+                'ttl_seconds': self._ttl,
+                'hits': self.hits,
+                'misses': self.misses,
+                'evictions': self.evictions,
+            }
+
+
+_options_cache = _BoundedTTLCache(maxsize=32, ttl_seconds=60)
+# (ticker, expiry_key) -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
+
+# Lightweight counters for /_internal/stats. No correctness dependency — purely observability.
+_schwab_stats = {
+    'option_chains': 0,
+    'quotes': 0,
+    'quote': 0,
+    'option_expiration_chain': 0,
+    'price_history': 0,
+    'last_error': None,
+    'last_error_at': None,
+}
+_schwab_stats_lock = threading.Lock()
+
+
+def _count_schwab(name, error=None):
+    """Increment a Schwab API counter; record last error message if any."""
+    with _schwab_stats_lock:
+        if name in _schwab_stats:
+            _schwab_stats[name] += 1
+        if error is not None:
+            _schwab_stats['last_error'] = str(error)[:240]
+            _schwab_stats['last_error_at'] = int(time.time())
+
+
+class _TokenBucketRateLimiter:
+    """Per-key token bucket. Used to cap /update* throughput so a runaway
+    client (or our own JS bug) can't saturate the Schwab API quota.
+
+    Defaults sized for a single-user dashboard: 20-token burst, 4/sec sustained.
+    The streaming auto-refresh path runs at ~1Hz so this leaves comfortable headroom.
+    """
+
+    def __init__(self, max_tokens=20, refill_per_sec=4.0):
+        self._max = float(max_tokens)
+        self._rate = float(refill_per_sec)
+        self._lock = threading.Lock()
+        self._buckets = {}  # key -> (tokens, last_ts)
+
+    def acquire(self, key):
+        with self._lock:
+            now = time.time()
+            tokens, last = self._buckets.get(key, (self._max, now))
+            tokens = min(self._max, tokens + (now - last) * self._rate)
+            if tokens < 1.0:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1.0, now)
+            return True
+
+
+_update_rate_limiter = _TokenBucketRateLimiter(max_tokens=20, refill_per_sec=4.0)
+
+
+# ── Risk-free rate (3-month T-bill, refreshed daily) ─────────────────────────
+# Hardcoded r=0.02 used to bias every Greek when rates moved. Now we pull the
+# 3-month Treasury yield (FRED's DGS3MO series) once per day. Fallback to a
+# constant if the fetch fails so a network blip never breaks chart rendering.
+_RISK_FREE_RATE_FALLBACK = 0.02
+_risk_free_rate_cache = {'value': None, 'fetched_at': 0}
+_risk_free_rate_lock = threading.Lock()
+
+
+def _fetch_dgs3mo():
+    """Pull the latest non-empty value from FRED's DGS3MO daily CSV.
+    Returns a decimal rate (e.g. 0.0533 for 5.33%) or None on any error.
+    No API key required — FRED's fredgraph CSV is unauthenticated.
+    """
+    try:
+        import requests as _requests
+        resp = _requests.get(
+            'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO',
+            timeout=4.0,
+            headers={'User-Agent': 'EzOptions-Schwab/1.0'},
+        )
+        if not resp.ok:
+            return None
+        # Lines look like: "2026-04-30,5.34". Last column is yield in percent.
+        # FRED uses '.' for missing values.
+        last_value = None
+        for line in resp.text.splitlines():
+            parts = line.split(',')
+            if len(parts) < 2:
+                continue
+            val = parts[-1].strip()
+            if not val or val == '.':
+                continue
+            try:
+                last_value = float(val)
+            except ValueError:
+                continue  # header row
+        if last_value is None:
+            return None
+        return last_value / 100.0
+    except Exception:
+        return None
+
+
+def _get_risk_free_rate():
+    """Cached risk-free rate. Refreshes once per 24h. Always returns a number."""
+    with _risk_free_rate_lock:
+        cached = _risk_free_rate_cache.get('value')
+        ts = _risk_free_rate_cache.get('fetched_at', 0)
+        if cached is not None and (time.time() - ts) < 86400:
+            return cached
+    # Fetch outside the lock so concurrent callers aren't serialized on network I/O.
+    fresh = _fetch_dgs3mo()
+    with _risk_free_rate_lock:
+        if fresh is not None and 0.0 <= fresh < 0.25:
+            _risk_free_rate_cache['value'] = fresh
+            _risk_free_rate_cache['fetched_at'] = time.time()
+            return fresh
+        # On failure, cache the fallback briefly so we don't hammer FRED.
+        if _risk_free_rate_cache.get('value') is None:
+            _risk_free_rate_cache['value'] = _RISK_FREE_RATE_FALLBACK
+            _risk_free_rate_cache['fetched_at'] = time.time() - 86400 + 600  # retry in 10min
+        return _risk_free_rate_cache['value']
+
+# Whitelisted enum values for free-form payload fields. Centralised so route
+# handlers and validators agree on what's accepted.
+_VALID_EXPOSURE_METRICS = ('Open Interest', 'Volume', 'Max OI vs Volume', 'OI + Volume')
+_VALID_COLORING_MODES   = ('Solid', 'Linear Intensity', 'Ranked Intensity')
+_VALID_HEATMAP_MODES    = ('Global', 'Per Expiration')
+_VALID_MAX_LEVEL_MODES  = ('Absolute', 'Per Expiration', 'Per Type')
+
+
+def _validate_update_payload(data, require_expiry=True):
+    """Light validation on an /update or /update_price body.
+
+    Returns (ok, error_message). Only checks fields with bounded value ranges
+    so that pathological inputs (negative strike_range, huge levels_count, etc.)
+    can't crash the server or DoS the Schwab API. Permissive on optional fields.
+    """
+    import re
+    if not isinstance(data, dict):
+        return False, 'Body must be a JSON object'
+
+    ticker = data.get('ticker')
+    if not isinstance(ticker, str) or not ticker.strip():
+        return False, 'ticker is required'
+    if len(ticker) > 12:
+        return False, 'ticker too long'
+    if not re.match(r'^[\$/]?[A-Za-z0-9._-]+$', ticker.strip()):
+        return False, 'ticker has invalid characters'
+
+    expiry = data.get('expiry')
+    if require_expiry and expiry in (None, '', []):
+        return False, 'expiry is required'
+    if expiry is not None and not isinstance(expiry, (str, list)):
+        return False, 'expiry must be a string or list of strings'
+    if isinstance(expiry, list):
+        for e in expiry:
+            if not isinstance(e, str):
+                return False, 'expiry list must contain strings'
+
+    sr = data.get('strike_range')
+    if sr is not None:
+        try:
+            srf = float(sr)
+            if not (0 < srf <= 1):
+                return False, 'strike_range must be in (0, 1]'
+        except (TypeError, ValueError):
+            return False, 'strike_range must be numeric'
+
+    lc = data.get('levels_count')
+    if lc is not None:
+        try:
+            lci = int(lc)
+            if not (1 <= lci <= 20):
+                return False, 'levels_count must be in [1, 20]'
+        except (TypeError, ValueError):
+            return False, 'levels_count must be an integer'
+
+    em = data.get('exposure_metric')
+    if em is not None and em not in _VALID_EXPOSURE_METRICS:
+        return False, f"exposure_metric must be one of {list(_VALID_EXPOSURE_METRICS)}"
+
+    cm = data.get('coloring_mode')
+    if cm is not None and cm not in _VALID_COLORING_MODES:
+        return False, f"coloring_mode must be one of {list(_VALID_COLORING_MODES)}"
+
+    hcm = data.get('heatmap_coloring_mode')
+    if hcm is not None and hcm not in _VALID_HEATMAP_MODES:
+        return False, f"heatmap_coloring_mode must be one of {list(_VALID_HEATMAP_MODES)}"
+
+    mlm = data.get('max_level_mode')
+    if mlm is not None and mlm not in _VALID_MAX_LEVEL_MODES:
+        return False, f"max_level_mode must be one of {list(_VALID_MAX_LEVEL_MODES)}"
+
+    tf = data.get('timeframe')
+    if tf is not None:
+        try:
+            tfi = int(tf)
+            if tfi not in (1, 5, 15, 30, 60):
+                return False, 'timeframe must be one of {1, 5, 15, 30, 60}'
+        except (TypeError, ValueError):
+            return False, 'timeframe must be an integer'
+
+    gs = data.get('gex_sign')
+    if gs is not None and gs not in VALID_GEX_SIGNS:
+        return False, f"gex_sign must be one of {list(VALID_GEX_SIGNS)}"
+
+    levels_types = data.get('levels_types')
+    if levels_types is not None:
+        if not isinstance(levels_types, list):
+            return False, 'levels_types must be a list'
+        if len(levels_types) > 12:
+            return False, 'levels_types: too many entries'
+        for lt in levels_types:
+            if not isinstance(lt, str):
+                return False, 'levels_types entries must be strings'
+
+    return True, None
+
+
+def _guard_update_request():
+    """Combined rate-limit + validation guard for the three /update* routes.
+
+    Also sets the request-scoped GEX sign convention from the payload's
+    `gex_sign` field so chart builders can read it via _get_gex_sign().
+
+    Returns a Flask response on rejection, or None on success (caller proceeds).
+    """
+    key = request.headers.get('X-Forwarded-For', request.remote_addr or 'local')
+    if not _update_rate_limiter.acquire(key):
+        return jsonify({'error': 'Rate limit exceeded — slow down requests.'}), 429
+    body = request.get_json(silent=True) or {}
+    require_expiry = request.path == '/update'
+    ok, err = _validate_update_payload(body, require_expiry=require_expiry)
+    if not ok:
+        return jsonify({'error': err}), 400
+    # Pin the GEX sign convention for the lifetime of this request.
+    _set_gex_sign(body.get('gex_sign', 'dealer'))
+    return None
 
 # Initialize Schwab client
 try:
@@ -1219,6 +1620,182 @@ class AlertEvaluator:
 alert_evaluator = AlertEvaluator()
 
 
+# ── End-of-day session report ────────────────────────────────────────────────
+def _compute_session_report(ticker, date_str):
+    """Build a summary of the trading session for (ticker, date) from stored
+    interval data. Pure read; idempotent. Returns a dict suitable for JSON
+    serialisation, or None if the ticker has no data on that date.
+    """
+    rows = get_interval_data(ticker, date=date_str) or []
+    if not rows:
+        return None
+
+    # rows: (timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+    #        abs_gex_total, net_volume, net_speed, net_vomma, net_color)
+    timestamps = sorted({r[0] for r in rows})
+    open_price = rows[0][1]
+    last_price = rows[-1][1]
+    high_price = max(r[1] for r in rows)
+    low_price  = min(r[1] for r in rows)
+
+    # Peak GEX strike — strike with the largest |net_gamma| at any minute.
+    peak_strike = None
+    peak_value = 0.0
+    peak_time = None
+    for ts, price, strike, net_gamma, *_ in rows:
+        if net_gamma is not None and abs(net_gamma) > abs(peak_value):
+            peak_strike = strike
+            peak_value = float(net_gamma)
+            peak_time = ts
+
+    # GEX sign flips at the ATM strike (closest to opening price).
+    flips = 0
+    if rows:
+        atm_strike = min({r[2] for r in rows}, key=lambda s: abs(s - open_price))
+        atm_series = [r for r in rows if r[2] == atm_strike]
+        prev_sign = 0
+        for r in atm_series:
+            ng = r[3] or 0
+            sign = 1 if ng > 0 else (-1 if ng < 0 else 0)
+            if sign != 0 and prev_sign != 0 and sign != prev_sign:
+                flips += 1
+            if sign != 0:
+                prev_sign = sign
+
+    # Expected-move accuracy — % of the session price stayed inside the band.
+    em_rows = get_interval_session_data(ticker, date=date_str) or []
+    em_inside = 0
+    em_total = 0
+    em_breached_upper = False
+    em_breached_lower = False
+    for ts, price, em, em_upper, em_lower in em_rows:
+        if em_upper is None or em_lower is None:
+            continue
+        em_total += 1
+        if em_lower <= price <= em_upper:
+            em_inside += 1
+        elif price > em_upper:
+            em_breached_upper = True
+        else:
+            em_breached_lower = True
+    em_accuracy = round(100.0 * em_inside / em_total, 2) if em_total else None
+
+    # Centroid drift — call vs put volume-weighted strike spread evolution.
+    centroid_open = centroid_close = None
+    centroid_min = centroid_max = None
+    centroid_drift = None
+    try:
+        with closing(sqlite3.connect('options_data.db')) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    """SELECT timestamp, call_centroid, put_centroid
+                       FROM centroid_data
+                       WHERE ticker = ? AND date = ?
+                       ORDER BY timestamp""",
+                    (ticker, date_str),
+                )
+                cs = cur.fetchall()
+        if cs:
+            spreads = [(r[1] - r[2]) for r in cs if r[1] is not None and r[2] is not None]
+            if spreads:
+                centroid_open = round(spreads[0], 4)
+                centroid_close = round(spreads[-1], 4)
+                centroid_min = round(min(spreads), 4)
+                centroid_max = round(max(spreads), 4)
+                centroid_drift = round(centroid_close - centroid_open, 4)
+    except Exception:
+        pass
+
+    return {
+        'date': date_str,
+        'ticker': ticker,
+        'open_price': round(open_price, 4),
+        'close_price': round(last_price, 4),
+        'high_price': round(high_price, 4),
+        'low_price': round(low_price, 4),
+        'session_range_pct': round((high_price - low_price) / open_price * 100, 3) if open_price else None,
+        'peak_gex_strike': peak_strike,
+        'peak_gex_value': round(peak_value, 2) if peak_value is not None else None,
+        'peak_gex_time': peak_time,
+        'atm_gex_flips': flips,
+        'em_accuracy_pct': em_accuracy,
+        'em_observations': em_total,
+        'em_breached_upper': em_breached_upper,
+        'em_breached_lower': em_breached_lower,
+        'centroid_drift': centroid_drift,
+        'centroid_open': centroid_open,
+        'centroid_close': centroid_close,
+        'centroid_min': centroid_min,
+        'centroid_max': centroid_max,
+        'minute_bars': len(timestamps),
+    }
+
+
+def _save_session_report(ticker, date_str):
+    """Compute + persist a session report. No-op if one already exists."""
+    summary = _compute_session_report(ticker, date_str)
+    if not summary:
+        return None
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """INSERT OR IGNORE INTO session_reports
+                   (date, ticker, peak_gex_strike, peak_gex_value,
+                    em_accuracy_pct, centroid_drift, summary_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (date_str, ticker, summary['peak_gex_strike'], summary['peak_gex_value'],
+                 summary['em_accuracy_pct'], summary['centroid_drift'],
+                 json.dumps(summary), int(time.time())),
+            )
+            conn.commit()
+            inserted = cur.rowcount
+    return summary if inserted else None
+
+
+def _session_report_scheduler():
+    """Background loop: at ~16:05 ET on weekdays, build a report for every
+    ticker that has interval data today but no report yet. Wakes every 5 min."""
+    while True:
+        try:
+            est = pytz.timezone('US/Eastern')
+            now = datetime.now(est)
+            in_window = (
+                now.weekday() < 5
+                and now.hour == 16
+                and 5 <= now.minute < 30
+            )
+            if in_window:
+                today = now.strftime('%Y-%m-%d')
+                with closing(sqlite3.connect('options_data.db')) as conn:
+                    with closing(conn.cursor()) as cur:
+                        cur.execute(
+                            "SELECT DISTINCT ticker FROM interval_data WHERE date = ?",
+                            (today,),
+                        )
+                        tickers = [r[0] for r in cur.fetchall()]
+                        cur.execute(
+                            "SELECT ticker FROM session_reports WHERE date = ?",
+                            (today,),
+                        )
+                        already = {r[0] for r in cur.fetchall()}
+                for t in tickers:
+                    if t in already:
+                        continue
+                    try:
+                        _save_session_report(t, today)
+                        print(f"[session_report] generated for {t} {today}")
+                    except Exception as e:
+                        print(f"[session_report] failed {t} {today}: {e}")
+        except Exception as e:
+            print(f"[session_report] scheduler loop error: {e}")
+        time.sleep(300)
+
+
+# Start the scheduler thread once. Daemon so it dies cleanly with the app.
+_session_report_thread = threading.Thread(target=_session_report_scheduler, daemon=True)
+_session_report_thread.start()
+
+
 # Helper Functions
 def format_ticker(ticker):
     if not ticker:
@@ -1570,6 +2147,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
 
     try:
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
+        _count_schwab('option_chains')
         chain_response = client.option_chains(
             symbol=ticker,
             fromDate=expiry.strftime('%Y-%m-%d'),
@@ -1597,20 +2175,41 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         # Calculate time to expiration in years
         t = calculate_time_to_expiration(expiry)
         t = max(t, 1e-5)  # Minimum 1 minute
-        r = 0.02  # risk-free rate (2% as default to match Yahoo script)
+        r = _get_risk_free_rate()  # 3-month T-bill, refreshed daily; falls back to 0.02
         
         calls_data = []
         puts_data = []
         display_tickers = format_display_ticker(ticker)
         
+        # Helper: pick the best IV available for an option. Prefers Schwab's
+        # value when it's plausible (>0); otherwise solves IV from the market mid
+        # via Black-Scholes. For illiquid strikes (volume<10) we also try the
+        # solver and prefer it when it produces a sane number, since Schwab's IV
+        # tends to be stale on those. Returns the IV plus a "solved_iv" diagnostic.
+        def _pick_iv(flag, schwab_iv, mid_price, K, vol_count):
+            schwab_ok = schwab_iv is not None and schwab_iv > 0
+            should_solve = (not schwab_ok) or (vol_count < 10 and mid_price and mid_price > 0)
+            solved = None
+            if should_solve and mid_price and mid_price > 0:
+                solved = solve_iv(mid_price, flag, S, K, t, r, 0)
+            if schwab_ok and (solved is None or vol_count >= 10):
+                return schwab_iv, solved
+            if solved is not None and solved > 0:
+                return solved, solved
+            return (schwab_iv if schwab_ok else 0.20), solved
+
         for exp_date, strikes in chain.get('callExpDateMap', {}).items():
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
                         K = float(option['strikePrice'])
                         raw_vol = float(option.get('volatility', -999.0))
-                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
-                        
+                        schwab_iv = (raw_vol / 100) if raw_vol > 0 else None
+                        bid = float(option['bid']); ask = float(option['ask'])
+                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask or float(option['last']))
+                        vol_count = int(option['totalVolume'])
+                        vol, solved_iv = _pick_iv('c', schwab_iv, mid, K, vol_count)
+
                         # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
                             delta, gamma, vega, vanna = calculate_greeks('c', S, K, t, vol, r, 0)
@@ -1618,16 +2217,18 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                             rho = calculate_rho('c', S, K, t, vol, r, 0)
                         else:
                             delta = gamma = theta = vega = rho = 0
-                        
+
                         option_data = {
                             'contractSymbol': option['symbol'],
                             'strike': K,
                             'lastPrice': float(option['last']),
-                            'bid': float(option['bid']),
-                            'ask': float(option['ask']),
-                            'volume': int(option['totalVolume']),
+                            'bid': bid,
+                            'ask': ask,
+                            'volume': vol_count,
                             'openInterest': int(option['openInterest']),
                             'impliedVolatility': vol,
+                            'schwab_iv': schwab_iv,
+                            'solved_iv': solved_iv,
                             'inTheMoney': option['inTheMoney'],
                             'expiration': datetime.strptime(exp_date.split(':')[0], '%Y-%m-%d').date(),
                             'delta': delta,
@@ -1638,15 +2239,19 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
                         calls_data.append(option_data)
-        
+
         for exp_date, strikes in chain.get('putExpDateMap', {}).items():
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
                         K = float(option['strikePrice'])
                         raw_vol = float(option.get('volatility', -999.0))
-                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
-                        
+                        schwab_iv = (raw_vol / 100) if raw_vol > 0 else None
+                        bid = float(option['bid']); ask = float(option['ask'])
+                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask or float(option['last']))
+                        vol_count = int(option['totalVolume'])
+                        vol, solved_iv = _pick_iv('p', schwab_iv, mid, K, vol_count)
+
                         # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
                             delta, gamma, vega, vanna = calculate_greeks('p', S, K, t, vol, r, 0)
@@ -1654,16 +2259,18 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                             rho = calculate_rho('p', S, K, t, vol, r, 0)
                         else:
                             delta = gamma = theta = vega = rho = 0
-                        
+
                         option_data = {
                             'contractSymbol': option['symbol'],
                             'strike': K,
                             'lastPrice': float(option['last']),
-                            'bid': float(option['bid']),
-                            'ask': float(option['ask']),
-                            'volume': int(option['totalVolume']),
+                            'bid': bid,
+                            'ask': ask,
+                            'volume': vol_count,
                             'openInterest': int(option['openInterest']),
                             'impliedVolatility': vol,
+                            'schwab_iv': schwab_iv,
+                            'solved_iv': solved_iv,
                             'inTheMoney': option['inTheMoney'],
                             'expiration': datetime.strptime(exp_date.split(':')[0], '%Y-%m-%d').date(),
                             'delta': delta,
@@ -1721,6 +2328,44 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         print(msg)
         # Propagate so callers (API routes) can return the error to clients
         raise Exception(msg)
+
+def _bs_price(flag, S, K, t, sigma, r=0.02, q=0):
+    """Black-Scholes-Merton option price for IV solving. flag in {'c','p'}."""
+    t = max(t, 1e-5)
+    sigma = max(sigma, 1e-6)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * np.sqrt(t))
+    d2 = d1 - sigma * np.sqrt(t)
+    if flag == 'c':
+        return S * np.exp(-q * t) * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+    return K * np.exp(-r * t) * norm.cdf(-d2) - S * np.exp(-q * t) * norm.cdf(-d1)
+
+
+def solve_iv(market_price, flag, S, K, t, r=0.02, q=0,
+             lo=0.01, hi=5.0, tol=1e-4, max_iter=64):
+    """Solve for implied volatility via Brent's method on Black-Scholes.
+
+    Returns the volatility that prices the option at `market_price`, or None
+    if the search interval doesn't bracket a root (e.g., price below intrinsic
+    or above the no-arbitrage upper bound).
+    """
+    try:
+        if market_price is None or market_price <= 0 or t <= 0 or S <= 0 or K <= 0:
+            return None
+        # Reject prices outside the no-arbitrage band — they have no valid IV.
+        intrinsic = max(0.0, S - K) if flag == 'c' else max(0.0, K - S)
+        upper_bound = S if flag == 'c' else K
+        if market_price < intrinsic - 1e-3 or market_price > upper_bound + 1e-3:
+            return None
+
+        f = lambda sigma: _bs_price(flag, S, K, t, sigma, r, q) - market_price
+        f_lo, f_hi = f(lo), f(hi)
+        if f_lo * f_hi > 0:
+            return None  # not bracketed — no solution in [lo, hi]
+        from scipy.optimize import brentq
+        return float(brentq(f, lo, hi, xtol=tol, maxiter=max_iter))
+    except Exception:
+        return None
+
 
 def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
     """Calculate delta, gamma, vega, vanna."""
@@ -1849,7 +2494,7 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
     if match:
         flag = match.group(1).lower()
 
-    r = 0.02  # risk-free rate
+    r = _get_risk_free_rate()  # 3-month T-bill, refreshed daily; falls back to 0.02
     q = 0
 
     # Re-calculate Greeks using consistent inputs
@@ -1918,6 +2563,7 @@ def get_current_price(ticker):
     elif ticker == "MARKET2":
         ticker = "SPY"
     try:
+        _count_schwab('quotes')
         quote_response = client.quotes(ticker)
         if not quote_response.ok:
             raise Exception(f"Failed to fetch quote: {quote_response.status_code} {quote_response.reason}")
@@ -1927,6 +2573,7 @@ def get_current_price(ticker):
         raise Exception("Malformed quote data returned from Schwab API")
     except Exception as e:
         msg = f"Error fetching price from Schwab API: {e}"
+        _count_schwab('quotes', error=msg)
         print(msg)
         raise Exception(msg)
 
@@ -1939,6 +2586,7 @@ def get_option_expirations(ticker):
     elif ticker == "MARKET2":
         ticker = "SPY"
     try:
+        _count_schwab('option_expiration_chain')
         response = client.option_expiration_chain(ticker)
         if not response.ok:
             raise Exception(f"Failed to fetch expirations: {response.status_code} {response.reason}")
@@ -2665,14 +3313,14 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         for strike in all_strikes:
             call_value = calls_df[calls_df['strike'] == strike][exposure_type].sum() if not calls_df.empty else 0
             put_value = puts_df[puts_df['strike'] == strike][exposure_type].sum() if not puts_df.empty else 0
-            
+
             if exposure_type == 'GEX':
-                net_value = call_value - put_value
+                net_value = gex_net(call_value, put_value)
             elif exposure_type == 'DEX':
                 net_value = call_value + put_value
             else:
                 net_value = call_value + put_value
-            
+
             net_exposure.append(net_value)
         
         # Calculate max for net exposure normalization
@@ -2830,7 +3478,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                     call_value = calls[calls['strike'] == strike][exposure_type].sum() if not calls.empty else 0
                     put_value = puts[puts['strike'] == strike][exposure_type].sum() if not puts.empty else 0
                     if exposure_type == 'GEX':
-                        net_value = call_value - put_value
+                        net_value = gex_net(call_value, put_value)
                     elif exposure_type == 'DEX':
                         net_value = call_value + put_value
                     else:
@@ -3261,6 +3909,7 @@ def get_price_history(ticker, timeframe=1):
         api_frequency = 30 if timeframe == 60 else timeframe
 
         # Convert dates to milliseconds since epoch
+        _count_schwab('price_history')
         response = client.price_history(
             symbol=ticker,
             frequencyType="minute",
@@ -3693,8 +4342,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
 
                     # Calculate Net Exposure based on type logic
                     if exposure_levels_type == 'GEX':
-                        # GEX is Call - Put (puts are positive in calculation)
-                        net_val = c_val - p_val
+                        net_val = gex_net(c_val, p_val)
                     elif exposure_levels_type == 'AbsGEX':
                         # Absolute GEX = |Call GEX| + |Put GEX|
                         net_val = abs(c_val) + abs(p_val)
@@ -4143,15 +4791,16 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                 put_ex = range_puts.groupby('strike')[col_name].sum().to_dict() if not range_puts.empty else {}
 
                 # GEX renders TWO overlays simultaneously:
-                #   (a) Original net top-N: top exposure_levels_count strikes by
-                #       |call_GEX - put_GEX|, signed (call-dom > 0, put-dom < 0).
+                #   (a) Net top-N (dealer convention: put − call). Top strikes by
+                #       |dealer net gamma|. Positive = dealers long gamma at that
+                #       strike (call colour); negative = short (put colour).
                 #       Internal etype='GEX', dash cycles on type_index=i.
                 #   (b) Per-side 5+5: top 5 call-side strikes (val > 0) and top 5
-                #       put-side strikes (val < 0). Internal etype='GEX_SIDE',
-                #       type_index=i+1 to pick a different dash.
+                #       put-side strikes (val < 0) — direction-agnostic concentration
+                #       view. Internal etype='GEX_SIDE'.
                 if etype == 'GEX':
                     all_strikes_g = set(call_ex.keys()) | set(put_ex.keys())
-                    net_levels = {s: call_ex.get(s, 0) - put_ex.get(s, 0) for s in all_strikes_g}
+                    net_levels = {s: gex_net(call_ex.get(s, 0), put_ex.get(s, 0)) for s in all_strikes_g}
                     net_top = sorted(net_levels.items(), key=lambda x: abs(x[1]), reverse=True)[:exposure_levels_count]
                     for strike, val in net_top:
                         all_top_levels.append((strike, val, 'GEX', i))
@@ -5500,6 +6149,122 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
         raise last_exception
 
     return combined_calls, combined_puts
+
+
+def create_flow_pulse_chart(ticker, expiry_dates=None, lookback_minutes=15,
+                            strike_range=None, latest_price=None,
+                            call_color='#00FF00', put_color='#FF0000'):
+    """Render ΔGEX-per-minute heatmap from interval_data over the last N minutes.
+
+    Pure derived view: reads stored 1-min snapshots, computes the per-strike
+    change vs the prior bar, and visualises the velocity of dealer gamma flow.
+    Bright green = gamma being added at that strike; bright red = unwound.
+    """
+    from collections import defaultdict
+
+    expiry_key = build_expiry_selection_key(expiry_dates) if expiry_dates else ''
+    rows = get_interval_data(ticker, expiry_key=expiry_key) or []
+    if not rows:
+        last_date = get_last_session_date(ticker, 'interval_data', expiry_key=expiry_key)
+        if last_date:
+            rows = get_interval_data(ticker, last_date, expiry_key=expiry_key) or []
+
+    fig = go.Figure()
+    if not rows:
+        fig.add_annotation(text="No interval data yet (Flow Pulse needs ≥2 minute bars)",
+                           showarrow=False, font=dict(color='#888', size=12),
+                           xref='paper', yref='paper', x=0.5, y=0.5)
+    else:
+        # Pivot by (timestamp, strike) → net_gamma. Schema in get_interval_data:
+        # row[0]=timestamp, row[1]=price, row[2]=strike, row[3]=net_gamma, ...
+        by_ts = defaultdict(dict)
+        all_strikes = set()
+        latest_seen_price = latest_price
+        for row in rows:
+            ts, price, strike, net_gamma = row[0], row[1], row[2], row[3]
+            by_ts[ts][strike] = net_gamma
+            all_strikes.add(strike)
+            latest_seen_price = price  # rows are ordered by timestamp asc
+
+        sorted_ts = sorted(by_ts.keys())
+        if len(sorted_ts) < 2:
+            fig.add_annotation(text="Need ≥2 minute bars for ΔGEX",
+                               showarrow=False, font=dict(color='#888', size=12),
+                               xref='paper', yref='paper', x=0.5, y=0.5)
+        else:
+            # Restrict to the requested lookback window.
+            cutoff_ts = sorted_ts[-1] - lookback_minutes * 60
+            selected_ts = [t for t in sorted_ts if t >= cutoff_ts]
+            if len(selected_ts) < 2:
+                # Fall back to last lookback_minutes bars by count
+                selected_ts = sorted_ts[-min(lookback_minutes, len(sorted_ts)):]
+
+            # Optional strike range filter around latest seen price.
+            if strike_range and latest_seen_price:
+                min_s = latest_seen_price * (1 - strike_range)
+                max_s = latest_seen_price * (1 + strike_range)
+                all_strikes = {s for s in all_strikes if min_s <= s <= max_s}
+
+            sorted_strikes = sorted(all_strikes, reverse=True)  # high strikes on top
+            if not sorted_strikes:
+                fig.add_annotation(text="No strikes in range",
+                                   showarrow=False, font=dict(color='#888', size=12),
+                                   xref='paper', yref='paper', x=0.5, y=0.5)
+            else:
+                # Build Δ matrix. First column has no Δ → set to 0.
+                delta_z = []
+                for strike in sorted_strikes:
+                    deltas = []
+                    prev_val = None
+                    for ts in selected_ts:
+                        val = by_ts[ts].get(strike, 0) or 0
+                        if prev_val is None:
+                            deltas.append(0.0)
+                        else:
+                            deltas.append(float(val) - float(prev_val))
+                        prev_val = val
+                    delta_z.append(deltas)
+
+                est = pytz.timezone('US/Eastern')
+                x_labels = [datetime.fromtimestamp(t, est).strftime('%H:%M') for t in selected_ts]
+                abs_max = max((abs(v) for r in delta_z for v in r), default=1.0) or 1.0
+
+                # Diverging colorscale anchored at zero. Put colour for negative Δ
+                # (gamma unwound), call colour for positive Δ (gamma accumulated).
+                fig.add_trace(go.Heatmap(
+                    z=delta_z,
+                    x=x_labels,
+                    y=sorted_strikes,
+                    zmin=-abs_max,
+                    zmax=abs_max,
+                    colorscale=[
+                        [0.0, put_color],
+                        [0.5, '#1E1E1E'],
+                        [1.0, call_color],
+                    ],
+                    colorbar=dict(title=dict(text='ΔGEX', font=dict(color='#CCCCCC')),
+                                  tickfont=dict(color='#CCCCCC')),
+                    hovertemplate='Strike: $%{y:.2f}<br>Time: %{x}<br>ΔGEX: %{z:,.0f}<extra></extra>',
+                ))
+                if latest_seen_price:
+                    fig.add_hline(y=latest_seen_price, line_dash='dot', line_color='#888',
+                                  line_width=1, opacity=0.6)
+
+    fig.update_layout(
+        title=build_left_aligned_title('Flow Pulse — ΔGEX per Minute', y=0.98),
+        xaxis=dict(title='Time (ET)', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True),
+        yaxis=dict(title='Strike', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=60, r=50, t=50, b=50),
+        autosize=True,
+    )
+    return fig.to_json()
+
 
 @app.route('/')
 def index():
@@ -7302,11 +8067,22 @@ def index():
                         <button id="streamToggle">Auto-Update</button>
                     </div>
                     <div class="settings-control">
-                        <button id="saveSettings" title="Save current settings to file">💾 Save</button>
-                        <button id="loadSettings" title="Load settings from file">📂 Load</button>
+                        <select id="profileSelect" title="Settings profile" style="max-width:140px">
+                            <option value="default">default</option>
+                        </select>
+                        <button id="saveSettings" title="Save current settings to selected profile">💾 Save</button>
+                        <button id="loadSettings" title="Load settings from selected profile">📂 Load</button>
+                        <button id="newProfile" title="Save as a new profile">＋</button>
+                        <button id="deleteProfile" title="Delete the selected profile" style="color:#c33">🗑</button>
                     </div>
                     <div class="alerts-control">
                         <button id="alertsButton" title="Manage strike-level alerts">🔔 Alerts <span id="alertsBadge" class="alerts-badge" style="display:none;">0</span></button>
+                    </div>
+                    <div class="alerts-control">
+                        <button id="positionsButton" title="Manage option positions and P&L">📈 Positions <span id="positionsBadge" class="alerts-badge" style="display:none;">0</span></button>
+                    </div>
+                    <div class="alerts-control">
+                        <button id="watchlistButton" title="Toggle multi-ticker watchlist sidebar">📋 Watchlist <span id="watchlistBadge" class="alerts-badge" style="display:none;">0</span></button>
                     </div>
                     <div class="control-group theme-control">
                         <label for="theme_select">Theme:</label>
@@ -7346,6 +8122,13 @@ def index():
                     <div class="control-group" title="When enabled, exposure formulas are adjusted by delta.">
                         <input type="checkbox" id="delta_adjusted_exposures">
                         <label for="delta_adjusted_exposures">Delta-Adjusted Exposures</label>
+                    </div>
+                    <div class="control-group" title="GEX sign convention. Dealer (put−call): positive = dealers long gamma (matches SqueezeMetrics/SpotGamma). Raw (call−put): positive = call concentration, no dealer assumption.">
+                        <label for="gex_sign">GEX Sign:</label>
+                        <select id="gex_sign">
+                            <option value="dealer" selected>Dealer (put−call)</option>
+                            <option value="raw">Raw (call−put)</option>
+                        </select>
                     </div>
                     <div class="control-group" title="When enabled, exposures are calculated in notional value (Dollars). When disabled, in share equivalents.">
                         <input type="checkbox" id="calculate_in_notional" checked>
@@ -7507,6 +8290,10 @@ def index():
             <div class="chart-checkbox">
                 <input type="checkbox" id="premium" checked>
                 <label for="premium">Premium by Strike</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="flow_pulse">
+                <label for="flow_pulse">Flow Pulse (ΔGEX)</label>
             </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="centroid" checked>
@@ -9565,6 +10352,8 @@ def index():
         });
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
+        const _gexSignEl = document.getElementById('gex_sign');
+        if (_gexSignEl) _gexSignEl.addEventListener('change', updateData);
         document.getElementById('heatmap_type').addEventListener('change', updateHeatmapOnly);
         document.getElementById('heatmap_coloring_mode').addEventListener('change', updateHeatmapOnly);
         document.getElementById('levels_count').addEventListener('input', updateData);
@@ -10188,6 +10977,7 @@ def index():
             const heatmapType = document.getElementById('heatmap_type').value;
             const heatmapColoringMode = document.getElementById('heatmap_coloring_mode').value;
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
+            const gexSign = (document.getElementById('gex_sign') || {}).value || 'dealer';
             const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
@@ -10209,7 +10999,8 @@ def index():
                 show_volume: document.getElementById('volume').checked,
                 show_large_trades: document.getElementById('large_trades').checked,
                 show_premium: document.getElementById('premium').checked,
-                show_centroid: document.getElementById('centroid').checked
+                show_centroid: document.getElementById('centroid').checked,
+                show_flow_pulse: document.getElementById('flow_pulse').checked
             };
 
             // Common payload fields shared by both requests
@@ -10279,6 +11070,7 @@ def index():
                     heatmap_type: heatmapType,
                     heatmap_coloring_mode: heatmapColoringMode,
                     delta_adjusted: deltaAdjusted,
+                    gex_sign: gexSign,
                     calculate_in_notional: calculateInNotional,
                     strike_range: strikeRange,
                     call_color: callColor,
@@ -10322,6 +11114,17 @@ def index():
                     try {
                         updateCharts(data);
                         updatePriceInfo(data.price_info);
+                        // Refresh position strike-lines on the price chart and the
+                        // header badge count.
+                        if (typeof window.renderPositionStrikeLines === 'function') {
+                            window.renderPositionStrikeLines(data.positions || []);
+                        }
+                        const _posBadge = document.getElementById('positionsBadge');
+                        if (_posBadge) {
+                            const _n = (data.positions || []).length;
+                            if (_n > 0) { _posBadge.textContent = _n; _posBadge.style.display = ''; }
+                            else        { _posBadge.style.display = 'none'; }
+                        }
                     } catch (renderError) {
                         console.error('Error rendering update payload:', renderError);
                         showError('Render Error: ' + normalizeFetchError(renderError));
@@ -12057,6 +12860,7 @@ def index():
                 highlight_max_level: document.getElementById('highlight_max_level').checked,
                 max_level_color: maxLevelColor,
                 coloring_mode: document.getElementById('coloring_mode').value,
+                gex_sign: (document.getElementById('gex_sign') || {}).value || 'dealer',
             };
         }
 
@@ -12160,7 +12964,8 @@ def index():
                 volume: document.getElementById('volume').checked,
                 large_trades: document.getElementById('large_trades').checked,
                 premium: document.getElementById('premium').checked,
-                centroid: document.getElementById('centroid').checked
+                centroid: document.getElementById('centroid').checked,
+                flow_pulse: document.getElementById('flow_pulse').checked
             };
 
             function resizeRegularCharts() {
@@ -12401,10 +13206,16 @@ def index():
                 const positive = regime.sign >= 0;
                 const regimeColor = positive ? callColor : putColor;
                 const arrow = positive ? '▲' : '▼';
-                const tip = `Net GEX in visible strike range\\nCalls: ${formatGexCompact(regime.total_call)}\\nPuts:  ${formatGexCompact(regime.total_put)}`;
+                // Server picks the label based on the active convention:
+                //   dealer → "Long Gamma" / "Short Gamma"
+                //   raw    → "Call-dominant" / "Put-dominant"
+                const regimeLabel = regime.label
+                    || (positive ? 'Long Gamma' : 'Short Gamma');
+                const conv = regime.convention === 'raw' ? 'Raw (call−put)' : 'Dealer (put−call)';
+                const tip = `Net GEX (${conv}) in visible strike range\\nCalls: ${formatGexCompact(regime.total_call)}\\nPuts:  ${formatGexCompact(regime.total_put)}`;
                 gexRegimeHtml = `<div class="price-info-item" title="${tip}">`
                     + `<strong>GEX Regime</strong>`
-                    + `<span style="color:${regimeColor}">${arrow} ${formatGexCompact(regime.net)} <span style="opacity:0.75">${positive ? 'Long Gamma' : 'Short Gamma'}</span></span>`
+                    + `<span style="color:${regimeColor}">${arrow} ${formatGexCompact(regime.net)} <span style="opacity:0.75">${regimeLabel}</span></span>`
                     + `</div>`;
             }
 
@@ -12764,7 +13575,8 @@ def index():
                     volume: document.getElementById('volume').checked,
                     large_trades: document.getElementById('large_trades').checked,
                     premium: document.getElementById('premium').checked,
-                    centroid: document.getElementById('centroid').checked
+                    centroid: document.getElementById('centroid').checked,
+                    flow_pulse: document.getElementById('flow_pulse').checked
                 }
             };
         }
@@ -12837,9 +13649,34 @@ def index():
             syncMobilePanelButtons();
         }
         
+        function getActiveProfile() {
+            const sel = document.getElementById('profileSelect');
+            return (sel && sel.value) ? sel.value : 'default';
+        }
+
+        function refreshProfileList(preferred) {
+            return fetch('/profiles').then(r => r.json()).then(data => {
+                const sel = document.getElementById('profileSelect');
+                if (!sel) return;
+                const before = preferred || sel.value || 'default';
+                const profiles = (data && data.profiles) || [];
+                if (!profiles.some(p => p.name === 'default')) {
+                    profiles.unshift({ name: 'default', updated_at: 0 });
+                }
+                sel.innerHTML = '';
+                profiles.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.name; opt.textContent = p.name;
+                    sel.appendChild(opt);
+                });
+                sel.value = profiles.some(p => p.name === before) ? before : 'default';
+            }).catch(() => {});
+        }
+
         function saveSettings() {
             const settings = gatherSettings();
-            fetch('/save_settings', {
+            const profile = getActiveProfile();
+            fetch('/save_settings?profile=' + encodeURIComponent(profile), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(settings)
@@ -12854,15 +13691,45 @@ def index():
                         btn.classList.remove('success');
                         btn.textContent = '💾 Save';
                     }, 2000);
+                    refreshProfileList(profile);
                 } else {
                     showError('Error saving settings: ' + data.error);
                 }
             })
             .catch(error => showError('Error saving settings: ' + error));
         }
-        
+
+        function newProfile() {
+            const raw = prompt('New profile name (alphanumeric, dashes, underscores, spaces — up to 64 chars):', '');
+            if (raw == null) return;
+            const name = String(raw).trim();
+            if (!name) return;
+            const settings = gatherSettings();
+            fetch('/save_settings?profile=' + encodeURIComponent(name), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            }).then(r => r.json()).then(data => {
+                if (data.success) refreshProfileList(name);
+                else showError('Error creating profile: ' + (data.error || 'unknown'));
+            });
+        }
+
+        function deleteProfile() {
+            const profile = getActiveProfile();
+            if (profile === 'default') {
+                showError('The "default" profile cannot be deleted.');
+                return;
+            }
+            if (!confirm('Delete profile "' + profile + '"? This cannot be undone.')) return;
+            fetch('/profiles/' + encodeURIComponent(profile), { method: 'DELETE' })
+                .then(r => r.json())
+                .then(() => refreshProfileList('default'));
+        }
+
         function loadSettings(showFeedback = true) {
-            fetch('/load_settings')
+            const profile = getActiveProfile();
+            fetch('/load_settings?profile=' + encodeURIComponent(profile))
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
@@ -12901,6 +13768,12 @@ def index():
         
         document.getElementById('saveSettings').addEventListener('click', saveSettings);
         document.getElementById('loadSettings').addEventListener('click', loadSettings);
+        document.getElementById('newProfile').addEventListener('click', newProfile);
+        document.getElementById('deleteProfile').addEventListener('click', deleteProfile);
+        // Auto-apply when user picks a different profile.
+        document.getElementById('profileSelect').addEventListener('change', () => loadSettings(false));
+        // Populate the profile dropdown on first load.
+        refreshProfileList('default');
         document.getElementById('theme_select').addEventListener('change', function(e) {
             applyTheme(e.target.value);
         });
@@ -13481,6 +14354,421 @@ def index():
         });
     })();
     </script>
+
+    <!-- ── Watchlist sidebar ─────────────────────────────────────────────────── -->
+    <aside id="watchlist-sidebar" aria-label="Watchlist">
+        <div class="wl-header">
+            <strong>📋 Watchlist</strong>
+            <button id="watchlist-close" aria-label="Close">×</button>
+        </div>
+        <div class="wl-add-row">
+            <input type="text" id="wl-add-input" placeholder="Add ticker (e.g. SPY)" maxlength="12">
+            <button id="wl-add-btn">＋</button>
+        </div>
+        <div id="watchlist-list"></div>
+    </aside>
+
+    <style>
+        #watchlistButton { position: relative; }
+        #watchlist-sidebar {
+            position: fixed; top: 0; right: 0; bottom: 0; width: 240px;
+            background: var(--panel-bg, #1a1a1a); color: var(--text-primary, #eef2f7);
+            border-left: 1px solid var(--border-color, #333);
+            box-shadow: -4px 0 16px rgba(0,0,0,0.45);
+            z-index: 8500;
+            transform: translateX(100%);
+            transition: transform 0.2s ease-out;
+            display: flex; flex-direction: column;
+            font-family: Arial, sans-serif;
+        }
+        #watchlist-sidebar.open { transform: translateX(0); }
+        #watchlist-sidebar .wl-header {
+            padding: 12px 14px; display: flex; justify-content: space-between;
+            align-items: center; border-bottom: 1px solid var(--border-color, #333);
+            font-size: 14px;
+        }
+        #watchlist-sidebar .wl-header button {
+            background: transparent; border: none; color: var(--text-secondary, #ccc);
+            font-size: 22px; cursor: pointer;
+        }
+        #watchlist-sidebar .wl-add-row {
+            display: flex; gap: 4px; padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color, #333);
+        }
+        #watchlist-sidebar .wl-add-row input {
+            flex: 1; padding: 5px 8px; font-size: 12px;
+            background: var(--panel-bg-alt, #2D2D2D); color: var(--text-primary, #eef2f7);
+            border: 1px solid var(--border-color, #333); border-radius: 3px;
+        }
+        #watchlist-sidebar .wl-add-row button {
+            padding: 4px 10px; background: var(--accent-color, #800080);
+            color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: 14px;
+        }
+        #watchlist-list { flex: 1; overflow-y: auto; padding: 6px; }
+        .wl-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 10px; margin-bottom: 4px; cursor: pointer;
+            background: var(--panel-bg-alt, #2D2D2D);
+            border: 1px solid var(--border-color, #333); border-radius: 3px;
+        }
+        .wl-row:hover { background: var(--panel-hover, #3a3a3a); }
+        .wl-row.active { border-left: 3px solid var(--accent-color, #800080); }
+        .wl-row .wl-tk { font-weight: 600; font-size: 13px; }
+        .wl-row .wl-px { font-size: 12px; color: var(--text-secondary, #ccc); }
+        .wl-row .wl-pct-pos { color: #26a269; font-size: 11px; font-weight: 600; }
+        .wl-row .wl-pct-neg { color: #c33; font-size: 11px; font-weight: 600; }
+        .wl-row .wl-del {
+            margin-left: 6px; background: transparent; border: none;
+            color: #888; cursor: pointer; font-size: 13px; padding: 0 4px;
+        }
+        .wl-row .wl-del:hover { color: #c33; }
+        .wl-empty { padding: 20px 12px; text-align: center; color: var(--text-muted, #888); font-size: 12px; }
+    </style>
+
+    <script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const sidebar = $('watchlist-sidebar');
+        const listEl  = $('watchlist-list');
+        let pollTimer = null;
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function renderRow(item) {
+            const q = item.quote || {};
+            const active = ((document.getElementById('ticker') || {}).value || '').toUpperCase() === item.ticker.toUpperCase();
+            let pxBlock;
+            if (q.error) {
+                pxBlock = '<div class="wl-px">' + escapeHtml(q.error) + '</div>';
+            } else {
+                const pctCls = q.change_pct >= 0 ? 'wl-pct-pos' : 'wl-pct-neg';
+                const sign   = q.change_pct >= 0 ? '+' : '';
+                pxBlock = '<div class="wl-px">$' + (q.last != null ? q.last.toFixed(2) : '—')
+                        + ' <span class="' + pctCls + '">' + sign + (q.change_pct != null ? q.change_pct.toFixed(2) : '0') + '%</span></div>';
+            }
+            return '<div class="wl-row' + (active ? ' active' : '') + '" data-ticker="' + escapeHtml(item.ticker) + '">'
+                 + '<div><div class="wl-tk">' + escapeHtml(item.ticker) + '</div>' + pxBlock + '</div>'
+                 + '<button class="wl-del" data-del="' + escapeHtml(item.ticker) + '" title="Remove">✕</button>'
+                 + '</div>';
+        }
+
+        function refreshWatchlist() {
+            fetch('/watchlist').then(r => r.json()).then(data => {
+                const items = (data && data.watchlist) || [];
+                if (!items.length) {
+                    listEl.innerHTML = '<div class="wl-empty">Empty. Add a ticker above to track its quote alongside the active dashboard.</div>';
+                } else {
+                    listEl.innerHTML = items.map(renderRow).join('');
+                }
+                const badge = document.getElementById('watchlistBadge');
+                if (badge) {
+                    if (items.length) { badge.textContent = items.length; badge.style.display = ''; }
+                    else { badge.style.display = 'none'; }
+                }
+            }).catch(() => {});
+        }
+
+        function startPolling() {
+            stopPolling();
+            refreshWatchlist();
+            pollTimer = setInterval(refreshWatchlist, 5000);
+        }
+        function stopPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        function openSidebar()  { sidebar.classList.add('open'); startPolling(); }
+        function closeSidebar() { sidebar.classList.remove('open'); stopPolling(); }
+        function toggleSidebar() {
+            if (sidebar.classList.contains('open')) closeSidebar();
+            else openSidebar();
+        }
+
+        function addTicker() {
+            const v = ($('wl-add-input').value || '').trim();
+            if (!v) return;
+            fetch('/watchlist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ticker: v }),
+            }).then(r => r.json()).then(d => {
+                if (d.error) { alert('Watchlist: ' + d.error); return; }
+                $('wl-add-input').value = '';
+                refreshWatchlist();
+            });
+        }
+
+        function handleListClick(e) {
+            const delBtn = e.target.closest('button[data-del]');
+            if (delBtn) {
+                e.stopPropagation();
+                const tk = delBtn.dataset.del;
+                fetch('/watchlist/' + encodeURIComponent(tk), { method: 'DELETE' })
+                    .then(() => refreshWatchlist());
+                return;
+            }
+            const row = e.target.closest('.wl-row[data-ticker]');
+            if (!row) return;
+            const tk = row.dataset.ticker;
+            const tickerEl = document.getElementById('ticker');
+            if (tickerEl) {
+                tickerEl.value = tk;
+                // Trigger the same flow as a manual ticker change.
+                tickerEl.dispatchEvent(new Event('change'));
+                if (typeof updateData === 'function') updateData();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = $('watchlistButton');
+            if (btn) btn.addEventListener('click', toggleSidebar);
+            $('watchlist-close').addEventListener('click', closeSidebar);
+            $('wl-add-btn').addEventListener('click', addTicker);
+            $('wl-add-input').addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); addTicker(); }
+            });
+            listEl.addEventListener('click', handleListClick);
+            // Populate the badge on first load even if the panel stays closed.
+            refreshWatchlist();
+        });
+    })();
+    </script>
+
+    <!-- ── Positions UI (manual P&L tracker) ─────────────────────────────────── -->
+    <div id="positions-modal" role="dialog" aria-modal="true" aria-labelledby="positions-modal-title">
+        <div class="am-card">
+            <div class="am-head">
+                <h2 id="positions-modal-title">📈 Option Positions</h2>
+                <button class="am-close" id="positions-modal-close" aria-label="Close">×</button>
+            </div>
+            <div class="am-body">
+                <div class="am-section">
+                    <h3>Add position</h3>
+                    <div class="am-grid">
+                        <div>
+                            <label for="po-ticker">Ticker</label>
+                            <input type="text" id="po-ticker" placeholder="SPY">
+                        </div>
+                        <div>
+                            <label for="po-side">Side</label>
+                            <select id="po-side"><option value="CALL">Call</option><option value="PUT">Put</option></select>
+                        </div>
+                        <div>
+                            <label for="po-qty">Qty (+ long, − short)</label>
+                            <input type="number" id="po-qty" step="1" value="1">
+                        </div>
+                        <div>
+                            <label for="po-strike">Strike</label>
+                            <input type="number" id="po-strike" step="0.5">
+                        </div>
+                        <div>
+                            <label for="po-expiry">Expiry (YYYY-MM-DD)</label>
+                            <input type="text" id="po-expiry" placeholder="2026-06-20">
+                        </div>
+                        <div>
+                            <label for="po-entry">Entry price (per contract)</label>
+                            <input type="number" id="po-entry" step="0.01">
+                        </div>
+                        <div style="grid-column:1/-1">
+                            <label for="po-label">Label (optional)</label>
+                            <input type="text" id="po-label" placeholder="e.g. earnings hedge">
+                        </div>
+                    </div>
+                    <div class="am-actions">
+                        <button class="am-btn" id="po-create">Add position</button>
+                    </div>
+                </div>
+                <div class="am-section">
+                    <h3>Open positions</h3>
+                    <div id="positions-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        #positions-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9000; align-items:center; justify-content:center; }
+        #positions-modal.open { display:flex; }
+        #positions-modal .am-card { background:var(--panel-bg, #1a1a1a); color:var(--text-primary, #eef2f7); border:1px solid var(--border-color, #333); border-radius:8px; width:min(760px, 92vw); max-height:86vh; display:flex; flex-direction:column; box-shadow:0 12px 36px rgba(0,0,0,0.6); }
+        .pos-row { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:var(--panel-bg-alt, #2D2D2D); border:1px solid var(--border-color, #333); border-radius:4px; font-size:12px; gap:8px; }
+        .pos-row .pos-pnl-pos { color:#26a269; font-weight:600; }
+        .pos-row .pos-pnl-neg { color:#c33; font-weight:600; }
+        .pos-row .pos-meta { color:var(--text-secondary, #ccc); font-size:11px; }
+        .pos-row-actions button { margin-left:4px; padding:3px 8px; background:transparent; border:1px solid var(--border-color, #333); color:var(--text-primary, #eef2f7); border-radius:3px; cursor:pointer; font-size:11px; }
+        .pos-row-actions button:hover { background:var(--panel-hover, #3a3a3a); }
+    </style>
+
+    <script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const modal = $('positions-modal');
+
+        function fmtPnl(n) {
+            if (n == null || isNaN(n)) return '—';
+            const sign = n >= 0 ? '+' : '';
+            return sign + '$' + Math.abs(n).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) * (n >= 0 ? 1 : -1);
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+            }[c]));
+        }
+
+        function refreshPositionsList() {
+            const tickerEl = $('ticker');
+            const t = tickerEl ? tickerEl.value : '';
+            const url = t ? '/positions?ticker=' + encodeURIComponent(t) : '/positions';
+            fetch(url).then(r => r.json()).then(data => {
+                const positions = (data && data.positions) || [];
+                renderPositionsList(positions);
+                updatePositionsBadge(positions.length);
+            });
+        }
+
+        function renderPositionsList(positions) {
+            const list = $('positions-list');
+            if (!positions.length) {
+                list.innerHTML = '<div class="am-empty">No open positions for this ticker.</div>';
+                return;
+            }
+            list.innerHTML = '';
+            positions.forEach(p => {
+                const row = document.createElement('div');
+                row.className = 'pos-row';
+                const sideTag = p.qty > 0 ? 'Long' : 'Short';
+                const summary = sideTag + ' ' + Math.abs(p.qty) + 'x ' + p.side + ' ' + p.strike + ' @ ' + p.expiry;
+                const entry = ' · entry $' + Number(p.entry_price).toFixed(2);
+                const cur = p.current_mid != null ? ' · mid $' + Number(p.current_mid).toFixed(2) : ' · mid —';
+                let pnlHtml;
+                if (p.pnl_total == null) {
+                    pnlHtml = '<span class="pos-meta">P&L —</span>';
+                } else {
+                    const cls = p.pnl_total >= 0 ? 'pos-pnl-pos' : 'pos-pnl-neg';
+                    const sign = p.pnl_total >= 0 ? '+' : '';
+                    pnlHtml = '<span class="' + cls + '">' + sign + '$' + Math.abs(p.pnl_total).toFixed(2) + '</span>';
+                }
+                row.innerHTML =
+                    '<div>'
+                    + '<strong>' + escapeHtml(p.label || summary) + '</strong>'
+                    + (p.label ? ('<div class="pos-meta">' + escapeHtml(summary) + '</div>') : '')
+                    + '<div class="pos-meta">' + escapeHtml(entry + cur) + '</div>'
+                    + '</div>'
+                    + '<div>' + pnlHtml + '</div>'
+                    + '<div class="pos-row-actions">'
+                    +   '<button data-act="close" data-id="' + p.id + '">Close</button>'
+                    +   '<button data-act="delete" data-id="' + p.id + '">Delete</button>'
+                    + '</div>';
+                list.appendChild(row);
+            });
+        }
+
+        function updatePositionsBadge(count) {
+            const b = $('positionsBadge');
+            if (!b) return;
+            if (count > 0) { b.textContent = count; b.style.display = ''; }
+            else            { b.style.display = 'none'; }
+        }
+
+        function openModal() {
+            const tickerEl = $('ticker');
+            if (tickerEl && !$('po-ticker').value) {
+                $('po-ticker').value = tickerEl.value || 'SPY';
+            }
+            modal.classList.add('open');
+            refreshPositionsList();
+        }
+        function closeModal() { modal.classList.remove('open'); }
+
+        function createPosition() {
+            const body = {
+                ticker: $('po-ticker').value.trim(),
+                side: $('po-side').value,
+                qty: parseInt($('po-qty').value, 10),
+                strike: parseFloat($('po-strike').value),
+                expiry: $('po-expiry').value.trim(),
+                entry_price: parseFloat($('po-entry').value),
+                label: $('po-label').value.trim() || null,
+            };
+            fetch('/positions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            }).then(r => r.json()).then(d => {
+                if (d.error) { alert('Position error: ' + d.error); return; }
+                $('po-strike').value = '';
+                $('po-entry').value = '';
+                $('po-label').value = '';
+                refreshPositionsList();
+            });
+        }
+
+        function handleListClick(e) {
+            const btn = e.target.closest('button[data-act]');
+            if (!btn) return;
+            const id = btn.dataset.id;
+            const act = btn.dataset.act;
+            if (act === 'delete') {
+                if (!confirm('Delete this position?')) return;
+                fetch('/positions/' + id, { method: 'DELETE' })
+                    .then(() => refreshPositionsList());
+            } else if (act === 'close') {
+                fetch('/positions/' + id, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: 'closed' }),
+                }).then(() => refreshPositionsList());
+            }
+        }
+
+        // Render owned-strike price lines on the lightweight price chart.
+        // Called by updatePriceInfo whenever /update returns a new positions array.
+        window.tvPositionPriceLines = window.tvPositionPriceLines || [];
+        window.renderPositionStrikeLines = function(positions) {
+            try {
+                if (typeof tvCandleSeries === 'undefined' || !tvCandleSeries) return;
+                window.tvPositionPriceLines.forEach(l => {
+                    try { tvCandleSeries.removePriceLine(l); } catch(_){}
+                });
+                window.tvPositionPriceLines = [];
+                (positions || []).forEach(p => {
+                    if (typeof p.strike !== 'number') return;
+                    const longSide = p.qty > 0;
+                    const isCall = (p.side || '').toUpperCase() === 'CALL';
+                    // Long calls / short puts → bullish (call colour). Long puts / short calls → bearish.
+                    const bullish = (isCall && longSide) || (!isCall && !longSide);
+                    const cc = (typeof callColor !== 'undefined' && callColor) ? callColor : '#26a269';
+                    const pc = (typeof putColor  !== 'undefined' && putColor)  ? putColor  : '#c33';
+                    const color = bullish ? cc : pc;
+                    const tag = (p.qty > 0 ? '+' : '') + p.qty + ' ' + p.side + ' @ ' + p.strike;
+                    const pl = tvCandleSeries.createPriceLine({
+                        price: p.strike,
+                        color: color,
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: tag,
+                    });
+                    window.tvPositionPriceLines.push(pl);
+                });
+            } catch (e) { console.warn('renderPositionStrikeLines failed:', e); }
+        };
+
+        // Wiring
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = $('positionsButton');
+            if (btn) btn.addEventListener('click', openModal);
+            $('positions-modal-close').addEventListener('click', closeModal);
+            modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+            $('po-create').addEventListener('click', createPosition);
+            $('positions-list').addEventListener('click', handleListClick);
+            // Initial badge load (no chart needed yet).
+            refreshPositionsList();
+        });
+    })();
+    </script>
 </body>
 </html>
     ''')
@@ -13501,11 +14789,14 @@ def get_expirations(ticker):
 
 @app.route('/update', methods=['POST'])
 def update():
+    rejection = _guard_update_request()
+    if rejection is not None:
+        return rejection
     data = request.get_json()
     ticker = data.get('ticker')
     expiry = data.get('expiry')  # This can now be a list or single value
-    
-    ticker = format_ticker(ticker) 
+
+    ticker = format_ticker(ticker)
     if not ticker or not expiry:
         return jsonify({'error': 'Missing ticker or expiry'}), 400
     
@@ -13702,7 +14993,36 @@ def update():
         if data.get('show_centroid', True):
             response['centroid'] = create_centroid_chart(ticker, call_color, put_color, expiry_dates)
 
+        if data.get('show_flow_pulse', False):
+            response['flow_pulse'] = create_flow_pulse_chart(
+                ticker, expiry_dates=expiry_dates, lookback_minutes=15,
+                strike_range=strike_range, latest_price=S,
+                call_color=call_color, put_color=put_color,
+            )
+
         
+        # Open positions for this ticker, enriched with current mid/P&L from
+        # the just-fetched chain. Cheap query — runs in one round-trip per /update.
+        try:
+            with closing(sqlite3.connect('options_data.db')) as _pconn:
+                with closing(_pconn.cursor()) as _pcur:
+                    _pcur.execute(
+                        """SELECT id, ticker, side, qty, strike, expiry, entry_price,
+                                  label, status, opened_at, closed_at
+                           FROM positions
+                           WHERE ticker = ? AND status = 'open'
+                           ORDER BY opened_at DESC""",
+                        (ticker,),
+                    )
+                    _pcols = [c[0] for c in _pcur.description]
+                    open_positions = [dict(zip(_pcols, _r)) for _r in _pcur.fetchall()]
+            for _p in open_positions:
+                _enrich_position(_p)
+            response['positions'] = open_positions
+        except Exception as _e:
+            print(f"[positions] enrichment skipped: {_e}")
+            response['positions'] = []
+
         # Add volume data to response
         response.update({
             'call_volume': call_volume,
@@ -13723,11 +15043,17 @@ def update():
             else:
                 quote_ticker = ticker
 
+            _count_schwab('quote')
             quote_response = client.quote(quote_ticker)
             if not quote_response.ok:
                 raise Exception(f"Failed to fetch quote for display: {quote_response.status_code} {quote_response.reason}")
 
             # --- GEX regime: net dealer gamma exposure across the visible range ---
+            # Sign comes from the user-selected convention (gex_sign in payload).
+            # 'dealer' (default) = put − call: positive = dealers long gamma →
+            # "Long Gamma" → vol-damping. Matches SqueezeMetrics/SpotGamma.
+            # 'raw' = call − put: positive = call dominance, "Call-dominant"
+            # rather than implying any dealer position.
             gex_regime = None
             try:
                 min_strike_g = S * (1 - strike_range)
@@ -13737,13 +15063,19 @@ def update():
                 if 'GEX' in rc.columns and 'GEX' in rp.columns:
                     tcg = float(rc['GEX'].sum())
                     tpg = float(rp['GEX'].sum())
-                    net_g = tcg - tpg
+                    net_g = gex_net(tcg, tpg)
+                    sign_used = _get_gex_sign()
+                    if sign_used == 'raw':
+                        label = 'Call-dominant' if net_g >= 0 else 'Put-dominant'
+                    else:
+                        label = 'Long Gamma' if net_g >= 0 else 'Short Gamma'
                     gex_regime = {
                         'net': net_g,
                         'total_call': tcg,
                         'total_put': tpg,
                         'sign': 1 if net_g >= 0 else -1,
-                        'label': 'Long Gamma' if net_g >= 0 else 'Short Gamma',
+                        'label': label,
+                        'convention': sign_used,
                     }
             except Exception:
                 gex_regime = None
@@ -13842,6 +15174,9 @@ def update():
 
 @app.route('/update_heatmap', methods=['POST'])
 def update_heatmap():
+    rejection = _guard_update_request()
+    if rejection is not None:
+        return rejection
     data = request.get_json()
     ticker = format_ticker(data.get('ticker'))
     expiry = data.get('expiry')
@@ -13894,6 +15229,9 @@ def update_price():
     Runs concurrently with /update so the price chart is never blocked
     by the heavier options-chain computations.
     """
+    rejection = _guard_update_request()
+    if rejection is not None:
+        return rejection
     data = request.get_json()
     ticker = data.get('ticker')
     expiry = data.get('expiry')
@@ -13960,27 +15298,110 @@ def update_price():
         return jsonify({'error': str(e)}), 500
 
 
+def _normalize_profile_name(name):
+    """Trim, default to 'default', and reject pathological names."""
+    name = (name or '').strip() or 'default'
+    if len(name) > 64:
+        return None
+    if not all(c.isalnum() or c in '-_ ' for c in name):
+        return None
+    return name
+
+
 @app.route('/save_settings', methods=['POST'])
 def save_settings():
+    """Persist a settings JSON blob under a named profile.
+
+    Body = full settings payload (same shape the dashboard already builds).
+    Profile name comes from ?profile=NAME (default: 'default'). Also mirrors
+    the legacy settings.json file for back-compat with older deployments.
+    """
     try:
-        settings = request.get_json()
-        with open('settings.json', 'w') as f:
-            json.dump(settings, f, indent=2)
-        return jsonify({'success': True})
+        settings = request.get_json() or {}
+        profile = _normalize_profile_name(request.args.get('profile'))
+        if profile is None:
+            return jsonify({'success': False, 'error': 'Invalid profile name'}), 400
+        with closing(sqlite3.connect('options_data.db')) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    """INSERT INTO user_settings (profile_name, payload_json, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(profile_name) DO UPDATE SET
+                           payload_json = excluded.payload_json,
+                           updated_at = excluded.updated_at""",
+                    (profile, json.dumps(settings), int(time.time())),
+                )
+                conn.commit()
+        # Mirror the default profile to settings.json so old code paths still work.
+        if profile == 'default':
+            try:
+                with open('settings.json', 'w') as f:
+                    json.dump(settings, f, indent=2)
+            except Exception:
+                pass
+        return jsonify({'success': True, 'profile': profile})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/load_settings')
 def load_settings():
+    """Load a named profile. Defaults to 'default'. Falls back to settings.json
+    when the requested profile is 'default' and no DB row exists yet."""
     try:
-        if os.path.exists('settings.json'):
+        profile = _normalize_profile_name(request.args.get('profile'))
+        if profile is None:
+            return jsonify({'error': 'Invalid profile name'}), 400
+        with closing(sqlite3.connect('options_data.db')) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute('SELECT payload_json FROM user_settings WHERE profile_name = ?', (profile,))
+                row = cur.fetchone()
+        if row:
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError):
+                payload = {}
+            payload['_profile'] = profile
+            return jsonify(payload)
+        # Back-compat: legacy settings.json maps to the 'default' profile.
+        if profile == 'default' and os.path.exists('settings.json'):
             with open('settings.json', 'r') as f:
-                settings = json.load(f)
-            return jsonify(settings)
-        else:
-            return jsonify({'error': 'No settings file found'})
+                payload = json.load(f)
+            payload['_profile'] = 'default'
+            return jsonify(payload)
+        return jsonify({'error': f'Profile "{profile}" not found'}), 404
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/profiles', methods=['GET'])
+def list_profiles():
+    """Return all saved profile names (and their last-updated timestamps)."""
+    try:
+        with closing(sqlite3.connect('options_data.db')) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute('SELECT profile_name, updated_at FROM user_settings ORDER BY profile_name')
+                rows = cur.fetchall()
+        profiles = [{'name': r[0], 'updated_at': r[1]} for r in rows]
+        # Surface the legacy default even if it only lives in settings.json.
+        if not any(p['name'] == 'default' for p in profiles) and os.path.exists('settings.json'):
+            profiles.insert(0, {'name': 'default', 'updated_at': int(os.path.getmtime('settings.json'))})
+        return jsonify({'profiles': profiles})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/profiles/<name>', methods=['DELETE'])
+def delete_profile(name):
+    """Delete a saved profile."""
+    profile = _normalize_profile_name(name)
+    if profile is None:
+        return jsonify({'error': 'Invalid profile name'}), 400
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute('DELETE FROM user_settings WHERE profile_name = ?', (profile,))
+            conn.commit()
+            return jsonify({'ok': True, 'rows': cur.rowcount})
 
 
 @app.route('/price_stream/<path:ticker>')
@@ -14316,6 +15737,573 @@ def alert_stream():
             'Connection': 'keep-alive',
         },
     )
+
+
+# ── Positions API (manual P&L tracking) ──────────────────────────────────────
+def _position_current_mid(ticker, side, strike, expiry_str):
+    """Look up the current mid price for a given (ticker, side, strike, expiry)
+    in _options_cache. Returns None if no cached data is available yet."""
+    if not ticker:
+        return None
+    norm_ticker = format_ticker(ticker)
+    target_side = (side or '').upper()
+    for (cache_ticker, expiry_key), cached in _options_cache.items():
+        if cache_ticker != norm_ticker:
+            continue
+        if expiry_key and expiry_str and expiry_str not in expiry_key.split('|'):
+            continue
+        df = cached.get('calls') if target_side == 'CALL' else cached.get('puts')
+        if df is None or df.empty:
+            continue
+        match = df[df['strike'] == float(strike)]
+        if match.empty:
+            continue
+        bid = float(match['bid'].iloc[0])
+        ask = float(match['ask'].iloc[0])
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if ask > 0:
+            return ask
+        if bid > 0:
+            return bid
+        return float(match['lastPrice'].iloc[0])
+    return None
+
+
+def _enrich_position(pos):
+    """Attach current_mid + unrealized P&L to a position dict for client display."""
+    cur = _position_current_mid(pos['ticker'], pos['side'], pos['strike'], pos['expiry'])
+    pos['current_mid'] = cur
+    if cur is not None:
+        pos['pnl_per_contract'] = round((cur - pos['entry_price']) * 100, 2)
+        pos['pnl_total'] = round(pos['pnl_per_contract'] * pos['qty'], 2)
+    else:
+        pos['pnl_per_contract'] = None
+        pos['pnl_total'] = None
+    return pos
+
+
+@app.route('/positions', methods=['GET'])
+def list_positions():
+    ticker = request.args.get('ticker')
+    status = request.args.get('status', 'open')
+    sql = ('SELECT id, ticker, side, qty, strike, expiry, entry_price, label, '
+           'status, opened_at, closed_at FROM positions')
+    where, vals = [], []
+    if ticker:
+        where.append('ticker = ?'); vals.append(format_ticker(ticker))
+    if status:
+        where.append('status = ?'); vals.append(status)
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY opened_at DESC'
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(sql, vals)
+            cols = [c[0] for c in cur.description]
+            positions = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for p in positions:
+        _enrich_position(p)
+    return jsonify({'positions': positions})
+
+
+@app.route('/positions', methods=['POST'])
+def create_position():
+    body = request.get_json(silent=True) or {}
+    ticker = format_ticker((body.get('ticker') or '').strip())
+    side = (body.get('side') or '').upper()
+    if not ticker or side not in ('CALL', 'PUT'):
+        return jsonify({'error': 'ticker and side (CALL|PUT) required'}), 400
+    try:
+        qty = int(body.get('qty', 0))
+        strike = float(body.get('strike'))
+        entry_price = float(body.get('entry_price'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'qty, strike, entry_price must be numeric'}), 400
+    if qty == 0:
+        return jsonify({'error': 'qty must be non-zero (positive=long, negative=short)'}), 400
+    if strike <= 0 or entry_price < 0:
+        return jsonify({'error': 'strike must be > 0, entry_price >= 0'}), 400
+    expiry = (body.get('expiry') or '').strip()
+    if not expiry:
+        return jsonify({'error': 'expiry required (YYYY-MM-DD)'}), 400
+    label = (body.get('label') or '').strip() or None
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """INSERT INTO positions (ticker, side, qty, strike, expiry, entry_price,
+                                          label, status, opened_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+                (ticker, side, qty, strike, expiry, entry_price, label, int(time.time())),
+            )
+            conn.commit()
+            return jsonify({'id': cur.lastrowid, 'ok': True})
+
+
+@app.route('/positions/<int:position_id>', methods=['PATCH'])
+def update_position(position_id):
+    body = request.get_json(silent=True) or {}
+    sets, vals = [], []
+    if 'status' in body:
+        if body['status'] not in ('open', 'closed'):
+            return jsonify({'error': "status must be 'open' or 'closed'"}), 400
+        sets.append('status = ?'); vals.append(body['status'])
+        if body['status'] == 'closed':
+            sets.append('closed_at = ?'); vals.append(int(time.time()))
+    if 'label' in body:
+        sets.append('label = ?'); vals.append((body['label'] or '').strip() or None)
+    if 'qty' in body:
+        try:
+            sets.append('qty = ?'); vals.append(int(body['qty']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'qty must be integer'}), 400
+    if 'entry_price' in body:
+        try:
+            sets.append('entry_price = ?'); vals.append(float(body['entry_price']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'entry_price must be numeric'}), 400
+    if not sets:
+        return jsonify({'error': 'no updatable fields supplied'}), 400
+    vals.append(position_id)
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(f"UPDATE positions SET {', '.join(sets)} WHERE id = ?", vals)
+            conn.commit()
+            return jsonify({'ok': True, 'rows': cur.rowcount})
+
+
+# ── Watchlist API ────────────────────────────────────────────────────────────
+def _fetch_quote_for(ticker):
+    """Fetch a single quote for the watchlist sidebar. Returns dict with last
+    price + day change, or {error: ...} on failure (no exceptions bubble up)."""
+    try:
+        if client is None:
+            return {'error': 'Schwab client not initialized'}
+        # Map MARKET aliases like the rest of the codebase does.
+        quote_ticker = ticker
+        if ticker == 'MARKET':
+            quote_ticker = '$SPX'
+        elif ticker == 'MARKET2':
+            quote_ticker = 'SPY'
+        _count_schwab('quote')
+        resp = client.quote(quote_ticker)
+        if not resp.ok:
+            return {'error': f'HTTP {resp.status_code}'}
+        data = resp.json() or {}
+        node = data.get(quote_ticker, {})
+        q = node.get('quote', {})
+        last = q.get('lastPrice')
+        if last is None:
+            return {'error': 'no quote'}
+        return {
+            'last': float(last),
+            'change': float(q.get('netChange', 0) or 0),
+            'change_pct': float(q.get('netPercentChange', 0) or 0),
+            'high': float(q.get('highPrice', last) or last),
+            'low':  float(q.get('lowPrice',  last) or last),
+        }
+    except Exception as e:
+        return {'error': str(e)[:120]}
+
+
+@app.route('/watchlist', methods=['GET'])
+def list_watchlist():
+    """Return the watchlist with live quote per ticker."""
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute('SELECT id, ticker, label, position, created_at FROM watchlist ORDER BY position, created_at')
+            rows = cur.fetchall()
+    items = []
+    for rid, ticker, label, position, created_at in rows:
+        item = {
+            'id': rid, 'ticker': ticker, 'label': label,
+            'position': position, 'created_at': created_at,
+        }
+        item['quote'] = _fetch_quote_for(ticker)
+        items.append(item)
+    return jsonify({'watchlist': items})
+
+
+@app.route('/watchlist', methods=['POST'])
+def add_watchlist():
+    body = request.get_json(silent=True) or {}
+    raw = (body.get('ticker') or '').strip()
+    if not raw:
+        return jsonify({'error': 'ticker required'}), 400
+    ticker = format_ticker(raw)
+    if not _validate_ticker_string(ticker):
+        return jsonify({'error': 'invalid ticker'}), 400
+    label = (body.get('label') or '').strip() or None
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            try:
+                cur.execute(
+                    """INSERT INTO watchlist (ticker, label, position, created_at)
+                       VALUES (?, ?, COALESCE((SELECT MAX(position) + 1 FROM watchlist), 0), ?)""",
+                    (ticker, label, int(time.time())),
+                )
+                conn.commit()
+                return jsonify({'ok': True, 'id': cur.lastrowid, 'ticker': ticker})
+            except sqlite3.IntegrityError:
+                return jsonify({'error': f'{ticker} already in watchlist'}), 409
+
+
+@app.route('/watchlist/<path:ticker>', methods=['DELETE'])
+def remove_watchlist(ticker):
+    norm = format_ticker(ticker.strip())
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute('DELETE FROM watchlist WHERE ticker = ?', (norm,))
+            conn.commit()
+            return jsonify({'ok': True, 'rows': cur.rowcount})
+
+
+def _validate_ticker_string(ticker):
+    """Cheap sanity check on a ticker symbol. Used by watchlist add."""
+    import re
+    if not isinstance(ticker, str) or not ticker:
+        return False
+    if len(ticker) > 12:
+        return False
+    return bool(re.match(r'^[\$/]?[A-Za-z0-9._-]+$', ticker))
+
+
+# ── Session Reports API ──────────────────────────────────────────────────────
+@app.route('/reports', methods=['GET'])
+def list_reports():
+    """List all stored session reports, optionally filtered by ticker."""
+    ticker = request.args.get('ticker')
+    sql = ('SELECT date, ticker, peak_gex_strike, peak_gex_value, '
+           'em_accuracy_pct, centroid_drift, created_at FROM session_reports')
+    vals = []
+    if ticker:
+        sql += ' WHERE ticker = ?'; vals.append(format_ticker(ticker))
+    sql += ' ORDER BY date DESC, ticker'
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(sql, vals)
+            cols = [c[0] for c in cur.description]
+            return jsonify({'reports': [dict(zip(cols, row)) for row in cur.fetchall()]})
+
+
+@app.route('/reports/run', methods=['POST'])
+def run_report():
+    """Manually trigger a report build for (ticker, date). Useful for testing
+    and back-filling. Idempotent — won't overwrite an existing report."""
+    body = request.get_json(silent=True) or {}
+    ticker = format_ticker((body.get('ticker') or '').strip())
+    date_str = (body.get('date') or '').strip()
+    if not ticker or not date_str:
+        return jsonify({'error': 'ticker and date (YYYY-MM-DD) required'}), 400
+    summary = _save_session_report(ticker, date_str)
+    if summary is None:
+        return jsonify({'error': f'no interval data for {ticker} on {date_str} (or already reported)'}), 404
+    return jsonify({'ok': True, 'summary': summary})
+
+
+@app.route('/reports/<date_str>')
+def get_report(date_str):
+    """Return the full report payload(s) for a date. ?ticker=X narrows it."""
+    ticker = request.args.get('ticker')
+    sql = 'SELECT ticker, summary_json FROM session_reports WHERE date = ?'
+    vals = [date_str]
+    if ticker:
+        sql += ' AND ticker = ?'; vals.append(format_ticker(ticker))
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(sql, vals)
+            rows = cur.fetchall()
+    out = []
+    for tk, payload in rows:
+        try:
+            out.append(json.loads(payload))
+        except (TypeError, ValueError):
+            pass
+    if not out:
+        return jsonify({'error': 'no report found'}), 404
+    return jsonify({'date': date_str, 'reports': out})
+
+
+# ── Replay / backtest on stored interval data ───────────────────────────────
+def _build_replay_figure(ticker, date_str, call_color='#00FF00', put_color='#FF0000', strike_range=None):
+    """Build a Plotly figure with one frame per minute, scrubbable via the
+    built-in slider. Each frame shows the per-strike net GEX as horizontal
+    bars at that timestamp; the spot-price horizontal line moves with the
+    underlying. Pure read from interval_data."""
+    rows = get_interval_data(ticker, date=date_str) or []
+    if not rows:
+        return None
+
+    from collections import defaultdict
+    by_ts = defaultdict(dict)
+    by_ts_price = {}
+    all_strikes = set()
+    for ts, price, strike, net_gamma, *_ in rows:
+        by_ts[ts][strike] = net_gamma or 0
+        by_ts_price[ts] = price
+        all_strikes.add(strike)
+
+    sorted_ts = sorted(by_ts.keys())
+    if not sorted_ts:
+        return None
+
+    # Optional strike-range trim around the latest spot of the day.
+    last_price = by_ts_price[sorted_ts[-1]]
+    if strike_range and last_price:
+        lo = last_price * (1 - strike_range)
+        hi = last_price * (1 + strike_range)
+        all_strikes = {s for s in all_strikes if lo <= s <= hi}
+    sorted_strikes = sorted(all_strikes)
+    if not sorted_strikes:
+        return None
+
+    est = pytz.timezone('US/Eastern')
+
+    def _gex_for_ts(ts):
+        return [by_ts[ts].get(s, 0) for s in sorted_strikes]
+
+    def _colors_for_ts(ts):
+        return [call_color if (by_ts[ts].get(s, 0) or 0) >= 0 else put_color for s in sorted_strikes]
+
+    # Choose a global x-range so frames don't jitter.
+    abs_max = 1.0
+    for ts in sorted_ts:
+        for v in _gex_for_ts(ts):
+            if abs(v) > abs_max:
+                abs_max = abs(v)
+
+    initial_trace = go.Bar(
+        x=_gex_for_ts(sorted_ts[0]),
+        y=sorted_strikes,
+        orientation='h',
+        marker=dict(color=_colors_for_ts(sorted_ts[0])),
+        hovertemplate='Strike: $%{y:.2f}<br>GEX: %{x:,.0f}<extra></extra>',
+        name='GEX',
+    )
+
+    frames = []
+    slider_steps = []
+    for ts in sorted_ts:
+        label = datetime.fromtimestamp(ts, est).strftime('%H:%M')
+        frames.append(go.Frame(
+            name=str(ts),
+            data=[go.Bar(
+                x=_gex_for_ts(ts),
+                y=sorted_strikes,
+                orientation='h',
+                marker=dict(color=_colors_for_ts(ts)),
+            )],
+            layout=dict(shapes=[
+                dict(type='line', xref='paper', yref='y',
+                     x0=0, x1=1, y0=by_ts_price[ts], y1=by_ts_price[ts],
+                     line=dict(color='#888', dash='dot', width=1)),
+            ], annotations=[
+                dict(x=0.99, y=by_ts_price[ts], xref='paper', yref='y',
+                     text=f"spot ${by_ts_price[ts]:.2f}", showarrow=False,
+                     font=dict(color='#aaa', size=10), xanchor='right'),
+            ]),
+        ))
+        slider_steps.append(dict(method='animate',
+                                 args=[[str(ts)], dict(mode='immediate', frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
+                                 label=label))
+
+    fig = go.Figure(
+        data=[initial_trace],
+        frames=frames,
+    )
+    fig.update_layout(
+        title=build_left_aligned_title(f'Replay — {ticker} {date_str}', y=0.98),
+        xaxis=dict(title='Net GEX', range=[-abs_max * 1.05, abs_max * 1.05],
+                   title_font=dict(color='#CCCCCC'), tickfont=dict(color='#CCCCCC'),
+                   gridcolor='#333', linecolor='#333', showline=True, mirror=True, zeroline=True, zerolinecolor='#666'),
+        yaxis=dict(title='Strike', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333',
+                   linecolor='#333', showline=True, mirror=True),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=70, r=50, t=70, b=50),
+        sliders=[dict(active=0, x=0, len=1.0, y=0, pad=dict(t=40, b=10),
+                      currentvalue=dict(prefix='Time: ', visible=True, xanchor='right'),
+                      steps=slider_steps)],
+        updatemenus=[dict(
+            type='buttons', direction='left', x=0, y=1.05, xanchor='left', yanchor='bottom',
+            buttons=[
+                dict(label='▶ Play', method='animate',
+                     args=[None, dict(frame=dict(duration=200, redraw=True), fromcurrent=True, transition=dict(duration=0))]),
+                dict(label='⏸ Pause', method='animate',
+                     args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate')]),
+            ],
+        )],
+    )
+    return fig
+
+
+@app.route('/replay/<date_str>')
+def replay_data(date_str):
+    """JSON: per-minute (price, strike, net_gamma) for a date+ticker."""
+    ticker = format_ticker(request.args.get('ticker', '').strip())
+    if not ticker:
+        return jsonify({'error': 'ticker query param required'}), 400
+    rows = get_interval_data(ticker, date=date_str) or []
+    if not rows:
+        return jsonify({'error': f'no interval data for {ticker} on {date_str}'}), 404
+    out = [
+        {'timestamp': r[0], 'price': r[1], 'strike': r[2], 'net_gamma': r[3]}
+        for r in rows
+    ]
+    return jsonify({'ticker': ticker, 'date': date_str, 'count': len(out), 'rows': out})
+
+
+@app.route('/replay/<date_str>/view')
+def replay_view(date_str):
+    """Standalone HTML page with a Plotly figure that scrubs through stored
+    interval data. Use the slider or Play button to animate the day."""
+    ticker = format_ticker(request.args.get('ticker', 'SPY').strip())
+    try:
+        sr_param = request.args.get('strike_range')
+        sr = float(sr_param) if sr_param else None
+    except ValueError:
+        sr = None
+    fig = _build_replay_figure(ticker, date_str, strike_range=sr)
+    if fig is None:
+        return Response(
+            f'<html><body style="background:#1E1E1E;color:#eef2f7;font-family:Arial;padding:30px">'
+            f'<h2>No interval data for {ticker} on {date_str}</h2>'
+            f'<a href="/reports/view" style="color:#7fafff">← back to reports</a></body></html>',
+            mimetype='text/html', status=404,
+        )
+    fig_json = fig.to_json()
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Replay — {ticker} {date_str}</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+body{{background:#1E1E1E;color:#eef2f7;font-family:Arial,sans-serif;margin:0;padding:14px}}
+h1{{margin:0 0 10px 0;font-size:16px}}
+.subtitle{{color:#888;font-size:12px;margin-bottom:14px}}
+#chart{{width:100%;height:80vh}}
+a{{color:#7fafff}}
+</style></head><body>
+<h1>⏯ Replay — {ticker} on {date_str}</h1>
+<div class="subtitle">Scrub the slider, or hit ▶ Play. <a href="/reports/view">reports</a> · <a href="/reports/{date_str}?ticker={ticker}">json</a></div>
+<div id="chart"></div>
+<script>
+const fig = {fig_json};
+Plotly.newPlot('chart', fig.data, fig.layout, {{responsive: true}}).then(() => {{
+    if (fig.frames) Plotly.addFrames('chart', fig.frames);
+}});
+</script>
+</body></html>"""
+    return Response(html, mimetype='text/html')
+
+
+@app.route('/reports/view')
+def view_reports():
+    """Tiny HTML page listing recent session reports. Read-only debug view."""
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """SELECT date, ticker, peak_gex_strike, peak_gex_value,
+                          em_accuracy_pct, centroid_drift, created_at, summary_json
+                   FROM session_reports
+                   ORDER BY date DESC, ticker
+                   LIMIT 200"""
+            )
+            rows = cur.fetchall()
+
+    body_rows = []
+    for date_str, tk, peak_k, peak_v, em_acc, drift, created_at, summary_json in rows:
+        try:
+            summary = json.loads(summary_json or '{}')
+        except (TypeError, ValueError):
+            summary = {}
+        rng = summary.get('session_range_pct')
+        flips = summary.get('atm_gex_flips')
+        breached = []
+        if summary.get('em_breached_upper'): breached.append('↑')
+        if summary.get('em_breached_lower'): breached.append('↓')
+        body_rows.append(
+            f'<tr><td>{date_str}</td><td><strong>{tk}</strong></td>'
+            f'<td>{peak_k or "—"}</td>'
+            f'<td>{peak_v if peak_v is not None else "—"}</td>'
+            f'<td>{flips if flips is not None else "—"}</td>'
+            f'<td>{em_acc if em_acc is not None else "—"}{" %" if em_acc is not None else ""}'
+            f' {"".join(breached)}</td>'
+            f'<td>{drift if drift is not None else "—"}</td>'
+            f'<td>{rng if rng is not None else "—"}{" %" if rng is not None else ""}</td>'
+            f'<td><a href="/reports/{date_str}?ticker={tk}">json</a></td></tr>'
+        )
+
+    if not body_rows:
+        body_rows = ['<tr><td colspan="9" style="text-align:center;padding:24px;color:#888">No reports yet — they generate at 16:05 ET on weekdays.</td></tr>']
+
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>EzOptions — Session Reports</title>
+<style>
+body{font-family:Arial,sans-serif;background:#1E1E1E;color:#eef2f7;padding:20px}
+h1{margin:0 0 14px 0;font-size:18px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{padding:8px 10px;border-bottom:1px solid #333;text-align:left}
+th{background:#2a2a2a;color:#aaa;font-weight:600}
+tr:hover td{background:#252525}
+a{color:#7fafff}
+.subtitle{color:#888;font-size:12px;margin-bottom:20px}
+</style></head><body>
+<h1>📋 Session Reports</h1>
+<div class="subtitle">Auto-generated daily at 16:05 ET. Snapshot of where dealer gamma piled up, EM band accuracy, and call/put centroid drift.</div>
+<table>
+<thead><tr><th>Date</th><th>Ticker</th><th>Peak GEX strike</th><th>Peak GEX value</th><th>ATM flips</th><th>EM acc.</th><th>Centroid drift</th><th>Range</th><th></th></tr></thead>
+<tbody>
+""" + "\n".join(body_rows) + """
+</tbody></table></body></html>"""
+    return Response(html, mimetype='text/html')
+
+
+@app.route('/_internal/stats')
+def internal_stats():
+    """Lightweight observability: cache stats, Schwab call counts, stream subs.
+    Use to debug "why is the dashboard slow" or "is my token actually working"."""
+    try:
+        with _schwab_stats_lock:
+            schwab_snapshot = dict(_schwab_stats)
+    except Exception:
+        schwab_snapshot = {}
+
+    stream_info = {'started': False, 'subscribed_tickers': [], 'subscriber_count': 0}
+    try:
+        stream_info['started'] = bool(getattr(price_streamer, '_started', False))
+        with price_streamer._lock:
+            tickers = sorted(price_streamer._queues.keys())
+            stream_info['subscribed_tickers'] = list(price_streamer._subscribed)
+            stream_info['subscriber_count'] = sum(len(q) for q in price_streamer._queues.values())
+    except Exception:
+        pass
+
+    rfr = None
+    rfr_age = None
+    try:
+        rfr = _risk_free_rate_cache.get('value')
+        ts = _risk_free_rate_cache.get('fetched_at', 0)
+        if ts:
+            rfr_age = round((time.time() - ts) / 60.0, 1)  # minutes
+    except Exception:
+        pass
+
+    return jsonify({
+        'cache': _options_cache.stats(),
+        'schwab': schwab_snapshot,
+        'stream': stream_info,
+        'risk_free_rate': rfr,
+        'risk_free_rate_age_minutes': rfr_age,
+        'time': int(time.time()),
+    })
+
+
+@app.route('/positions/<int:position_id>', methods=['DELETE'])
+def delete_position(position_id):
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute('DELETE FROM positions WHERE id = ?', (position_id,))
+            conn.commit()
+            return jsonify({'ok': True, 'rows': cur.rowcount})
 
 
 if __name__ == '__main__':
