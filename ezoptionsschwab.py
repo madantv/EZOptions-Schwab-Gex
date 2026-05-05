@@ -1891,6 +1891,10 @@ def format_ticker(ticker):
         return '$NDX'  # Return $NDX for API calls
     elif ticker in ['VIX', '$VIX']:
         return '$VIX'  # Return $VIX for API calls
+    elif ticker in ['RUT', '$RUT']:
+        return '$RUT'  # Russell 2000 cash index — Schwab uses $-prefix
+    elif ticker in ['DJX', '$DJX']:
+        return '$DJX'  # Dow Jones cash index
     return ticker
 
 def format_display_ticker(ticker):
@@ -1909,6 +1913,13 @@ def format_display_ticker(ticker):
     elif ticker in ['$VIX', 'VIX']:
         # For VIX, return VIX for options symbols and $VIX for underlying
         return ['VIX', '$VIX']
+    elif ticker in ['$RUT', 'RUT']:
+        # Russell 2000: monthly options use root RUT, weeklies use RUTW.
+        # Both start with 'RUT' so the prefix-match in fetch_options_for_date
+        # picks up either when we keep the entry list short.
+        return ['RUT', '$RUT']
+    elif ticker in ['$DJX', 'DJX']:
+        return ['DJX', '$DJX']
     elif ticker == 'MARKET2':
         return ['SPY']
     return [ticker]
@@ -17353,6 +17364,33 @@ class _TaggingForwarder:
             pass
 
 
+def _scanner_quote_snapshot(ticker):
+    """One Schwab quote call → (last, prev_close, net_change, net_pct).
+    Used by the scanner so we don't burn a second round-trip just to read
+    yesterday's close."""
+    if client is None:
+        raise Exception("Schwab API client not initialized.")
+    _count_schwab('quotes')
+    resp = client.quotes(ticker)
+    if not resp.ok:
+        raise Exception(f"Failed to fetch quote: {resp.status_code} {resp.reason}")
+    payload = resp.json() or {}
+    q = (payload.get(ticker) or {}).get('quote') or {}
+    last = q.get('lastPrice')
+    prev_close = q.get('closePrice')
+    net_change = q.get('netChange')
+    net_pct = q.get('netPercentChange')
+    if (net_change is None or net_pct is None) and last is not None and prev_close:
+        net_change = float(last) - float(prev_close)
+        net_pct = (net_change / float(prev_close)) * 100.0 if prev_close else None
+    return (
+        float(last) if last is not None else None,
+        float(prev_close) if prev_close is not None else None,
+        float(net_change) if net_change is not None else None,
+        float(net_pct) if net_pct is not None else None,
+    )
+
+
 def _scanner_compute_row(ticker, today):
     """Fetch the nearest-expiry chain for one ticker and compute the scanner
     row signals. Returns a dict or None if data is missing."""
@@ -17368,7 +17406,7 @@ def _scanner_compute_row(ticker, today):
     calls, puts = fetch_options_for_date(ticker, nearest)
     if (calls is None or calls.empty) and (puts is None or puts.empty):
         return None
-    S = get_current_price(ticker)
+    S, prev_close, net_change, net_pct = _scanner_quote_snapshot(ticker)
     if S is None:
         return None
 
@@ -17411,6 +17449,9 @@ def _scanner_compute_row(ticker, today):
     return {
         'ticker': ticker,
         'spot': float(S),
+        'prev_close': prev_close,
+        'net_change': net_change,
+        'net_pct': net_pct,
         'expiry': nearest,
         'dte': dte,
         'call_volume': call_vol,
@@ -17718,6 +17759,8 @@ _SCANNER_HTML = """<!doctype html>
   const COLS = [
     {key:'ticker',  label:'Ticker',  type:'str'},
     {key:'spot',    label:'Spot',    type:'num', fmt:fmtPrice},
+    {key:'net_change', label:'Δ$',   type:'num', fmt:fmtSignedPrice},
+    {key:'net_pct',    label:'Δ%',   type:'num', fmt:fmtSignedPct},
     {key:'dte',     label:'DTE',     type:'num', fmt:v=>v==null?'—':String(v)+'d'},
     {key:'call_volume',label:'Call V', type:'num', fmt:fmtVol},
     {key:'put_volume', label:'Put V',  type:'num', fmt:fmtVol},
@@ -17758,6 +17801,11 @@ _SCANNER_HTML = """<!doctype html>
     if (n == null || isNaN(n)) return '—';
     const sign = n >= 0 ? '+' : '';
     return '<span class="' + (n >= 0 ? 'pos' : 'neg') + '">' + sign + n.toFixed(2) + '%</span>';
+  }
+  function fmtSignedPrice(n) {
+    if (n == null || isNaN(n)) return '—';
+    const sign = n >= 0 ? '+' : '';
+    return '<span class="' + (n >= 0 ? 'pos' : 'neg') + '">' + sign + Number(n).toFixed(2) + '</span>';
   }
   function fmtLoudest(o) {
     if (!o) return '—';
@@ -17835,6 +17883,13 @@ _SCANNER_HTML = """<!doctype html>
     const r = rowsByTicker[ticker];
     if (!r) return;
     r.spot = last;
+    // Recompute daily change against the cached previous close — live ticks
+    // only carry `last`, so we keep prev_close from the scan and roll our
+    // own delta rather than waiting for the next scan to refresh the cells.
+    if (r.prev_close != null && last) {
+      r.net_change = last - r.prev_close;
+      r.net_pct = (r.net_change / r.prev_close) * 100.0;
+    }
     if (r.gamma_flip != null && last) {
       r.flip_distance_pct = (r.gamma_flip - last) / last * 100;
     }
@@ -17842,8 +17897,9 @@ _SCANNER_HTML = """<!doctype html>
     const tr = document.querySelector('tr[data-ticker="'+CSS.escape(ticker)+'"]');
     if (!tr) return;
     const cells = tr.querySelectorAll('td');
+    const liveKeys = new Set(['spot', 'net_change', 'net_pct', 'flip_distance_pct']);
     COLS.forEach((c, i) => {
-      if (c.key === 'spot' || c.key === 'flip_distance_pct') {
+      if (liveKeys.has(c.key)) {
         const newHtml = c.fmt ? c.fmt(r[c.key]) : (r[c.key] == null ? '—' : escapeHtml(r[c.key]));
         if (cells[i]) {
           cells[i].innerHTML = newHtml;
