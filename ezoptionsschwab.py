@@ -8221,6 +8221,265 @@ def index():
         <span class="error-close" onclick="hideError()">&times;</span>
         <div id="error-message"></div>
     </div>
+
+    <!-- ── Top Options banner ──────────────────────────────────────────────── -->
+    <div id="top-options-banner" role="region" aria-label="Top traded options">
+        <div class="tob-side tob-calls">
+            <span class="tob-label tob-label-calls">📞 TOP CALLS</span>
+            <div class="tob-chips" id="tob-calls"></div>
+        </div>
+        <div class="tob-side tob-puts">
+            <span class="tob-label tob-label-puts">📉 TOP PUTS</span>
+            <div class="tob-chips" id="tob-puts"></div>
+        </div>
+        <div class="tob-actions">
+            <span class="tob-stamp" id="tob-stamp" title="Auto-refresh every 5 minutes">—</span>
+            <button class="tob-btn" id="tob-refresh" title="Refresh now">⟳</button>
+            <button class="tob-btn" id="tob-dismiss" title="Hide banner">×</button>
+        </div>
+    </div>
+    <button id="tob-show" title="Show top-options banner" style="display:none;">📞 Top options</button>
+
+    <style>
+        #top-options-banner {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 12px;
+            background: var(--panel-bg-alt, #232323);
+            border-bottom: 1px solid var(--border-color, #333);
+            color: var(--text-primary, #eef2f7);
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+        }
+        #top-options-banner.tob-hidden { display: none; }
+        #top-options-banner .tob-side {
+            display: flex; align-items: center; gap: 8px; flex: 1;
+            min-width: 0;
+        }
+        #top-options-banner .tob-label {
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            font-size: 11px;
+            white-space: nowrap;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        #top-options-banner .tob-label-calls { background: rgba(38, 162, 105, 0.15); color: #26a269; }
+        #top-options-banner .tob-label-puts  { background: rgba(255, 92, 92, 0.15); color: #ff5c5c; }
+        #top-options-banner .tob-chips {
+            display: flex; gap: 6px; overflow-x: auto;
+            scrollbar-width: thin;
+            min-width: 0;
+        }
+        #top-options-banner .tob-chip {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 3px 8px;
+            background: var(--panel-bg, #1a1a1a);
+            border: 1px solid var(--border-color, #333);
+            border-radius: 999px;
+            white-space: nowrap;
+            font-variant-numeric: tabular-nums;
+            cursor: default;
+            transition: border-color 0.15s ease;
+        }
+        #top-options-banner .tob-chip:hover { border-color: rgba(255,255,255,0.25); }
+        #top-options-banner .tob-chip-call { border-left: 3px solid #26a269; }
+        #top-options-banner .tob-chip-put  { border-left: 3px solid #ff5c5c; }
+        #top-options-banner .tob-chip-strike { font-weight: 700; }
+        #top-options-banner .tob-chip-last   { color: var(--text-secondary, #b9c1cb); }
+        #top-options-banner .tob-chip-vol {
+            font-size: 10.5px;
+            color: var(--text-muted, #888);
+        }
+        #top-options-banner .tob-chip-dte {
+            font-size: 10px; color: var(--text-muted, #888);
+            padding: 1px 5px; border-radius: 3px;
+            background: rgba(255,255,255,0.05);
+        }
+        #top-options-banner .tob-empty {
+            color: var(--text-muted, #888); font-style: italic; font-size: 11px;
+            padding: 3px 0;
+        }
+        #top-options-banner .tob-actions {
+            display: flex; gap: 4px; align-items: center;
+            margin-left: auto;
+        }
+        #top-options-banner .tob-stamp {
+            font-size: 10px; color: var(--text-muted, #888);
+            margin-right: 4px; font-variant-numeric: tabular-nums;
+        }
+        #top-options-banner .tob-btn {
+            background: transparent; border: 1px solid var(--border-color, #333);
+            color: var(--text-secondary, #ccc);
+            border-radius: 4px;
+            padding: 2px 7px; cursor: pointer;
+            font-size: 13px; line-height: 1;
+        }
+        #top-options-banner .tob-btn:hover { background: rgba(255,255,255,0.05); }
+
+        #tob-show {
+            position: fixed; top: 8px; right: 8px;
+            z-index: 8000;
+            background: var(--panel-bg-alt, #232323);
+            color: var(--text-primary, #eef2f7);
+            border: 1px solid var(--border-color, #333);
+            padding: 4px 10px; border-radius: 4px; cursor: pointer;
+            font-size: 11px;
+        }
+        #tob-show:hover { background: var(--panel-hover, #3a3a3a); }
+
+        @media (max-width: 720px) {
+            #top-options-banner { font-size: 11px; padding: 6px 8px; gap: 6px; }
+            #top-options-banner .tob-side { flex-direction: column; align-items: flex-start; flex: 1 1 100%; }
+            #top-options-banner .tob-actions { width: 100%; justify-content: flex-end; }
+        }
+    </style>
+
+    <script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const REFRESH_MS = 5 * 60 * 1000;
+        const STORAGE_KEY = 'topOptionsBannerDismissed';
+        let pollTimer = null;
+        let inflight = false;
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+        function fmtVol(n) {
+            if (n == null || isNaN(n)) return '0';
+            const a = Math.abs(n);
+            if (a >= 1e6) return (a / 1e6).toFixed(1) + 'M';
+            if (a >= 1e3) return (a / 1e3).toFixed(1) + 'K';
+            return String(Math.round(a));
+        }
+        function fmtPrice(n) {
+            if (n == null || isNaN(n)) return '—';
+            return Number(n).toFixed(2);
+        }
+        function fmtStrike(n) {
+            if (n == null || isNaN(n)) return '—';
+            return Number(n).toFixed(Number.isInteger(+n) ? 0 : 2).replace(/\.00$/, '');
+        }
+        function fmtStamp(iso) {
+            if (!iso) return '—';
+            try {
+                const d = new Date(iso);
+                return 'updated ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch (e) { return '—'; }
+        }
+
+        function getActiveTicker() {
+            const el = document.getElementById('ticker');
+            return el && el.value ? String(el.value).toUpperCase().trim() : '';
+        }
+        function getSelectedExpiries() {
+            return Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked'))
+                .map(cb => cb.value).filter(Boolean);
+        }
+
+        function chipHtml(item, side) {
+            const sideCls = side === 'call' ? 'tob-chip-call' : 'tob-chip-put';
+            const dte = item.dte != null ? '<span class="tob-chip-dte">' + item.dte + 'd</span>' : '';
+            return '<span class="tob-chip ' + sideCls + '" title="' + escapeHtml(item.contract) + '">'
+                +  '<span class="tob-chip-strike">' + escapeHtml(fmtStrike(item.strike)) + '</span>'
+                +  '<span class="tob-chip-last">$' + escapeHtml(fmtPrice(item.last)) + '</span>'
+                +  '<span class="tob-chip-vol">' + escapeHtml(fmtVol(item.volume)) + '</span>'
+                +  dte
+                +  '</span>';
+        }
+
+        function render(payload) {
+            const calls = payload.top_calls || [];
+            const puts  = payload.top_puts  || [];
+            $('tob-calls').innerHTML = calls.length
+                ? calls.map(c => chipHtml(c, 'call')).join('')
+                : '<span class="tob-empty">no volume yet</span>';
+            $('tob-puts').innerHTML  = puts.length
+                ? puts.map(p => chipHtml(p, 'put')).join('')
+                : '<span class="tob-empty">no volume yet</span>';
+            $('tob-stamp').textContent = fmtStamp(payload.as_of);
+        }
+
+        function renderError(msg) {
+            $('tob-calls').innerHTML = '<span class="tob-empty">' + escapeHtml(msg) + '</span>';
+            $('tob-puts').innerHTML  = '';
+        }
+
+        function refresh() {
+            if (inflight) return;
+            const ticker = getActiveTicker();
+            const expiries = getSelectedExpiries();
+            if (!ticker || !expiries.length) {
+                renderError('Select a ticker and expiry to populate top options');
+                return;
+            }
+            inflight = true;
+            fetch('/top_options', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ticker, expiry: expiries, limit: 5 }),
+            })
+            .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
+            .then(({ ok, body }) => {
+                if (!ok || body.error) renderError(body.error || 'Failed to load top options');
+                else render(body);
+            })
+            .catch(err => renderError('Network error: ' + err))
+            .finally(() => { inflight = false; });
+        }
+
+        function startPolling() {
+            stopPolling();
+            refresh();
+            pollTimer = setInterval(refresh, REFRESH_MS);
+        }
+        function stopPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        function hideBanner() {
+            $('top-options-banner').classList.add('tob-hidden');
+            $('tob-show').style.display = '';
+            stopPolling();
+            try { localStorage.setItem(STORAGE_KEY, '1'); } catch (e) {}
+        }
+        function showBanner() {
+            $('top-options-banner').classList.remove('tob-hidden');
+            $('tob-show').style.display = 'none';
+            try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+            startPolling();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            $('tob-refresh').addEventListener('click', refresh);
+            $('tob-dismiss').addEventListener('click', hideBanner);
+            $('tob-show').addEventListener('click', showBanner);
+
+            // Re-fetch when ticker/expiries change so banner stays in sync.
+            const tickerEl = document.getElementById('ticker');
+            if (tickerEl) tickerEl.addEventListener('change', refresh);
+            document.addEventListener('change', (e) => {
+                if (e.target && e.target.matches('.expiry-option input[type="checkbox"]')) {
+                    refresh();
+                }
+            });
+
+            // Honor previous dismissal.
+            let dismissed = false;
+            try { dismissed = localStorage.getItem(STORAGE_KEY) === '1'; } catch (e) {}
+            if (dismissed) {
+                $('top-options-banner').classList.add('tob-hidden');
+                $('tob-show').style.display = '';
+            } else {
+                startPolling();
+            }
+        });
+    })();
+    </script>
+
     <div class="container">
         <div class="header">
             <div class="header-top">
@@ -16974,6 +17233,84 @@ def _validate_ticker_string(ticker):
     if len(ticker) > 12:
         return False
     return bool(re.match(r'^[\$/]?[A-Za-z0-9._-]+$', ticker))
+
+
+# ── Top Options API ──────────────────────────────────────────────────────────
+@app.route('/top_options', methods=['POST'])
+def top_options():
+    """Top-N most-actively-traded calls and puts by today's volume for the
+    active ticker + selected expiries. Drives the top-of-page banner."""
+    rejection = _guard_update_request()
+    if rejection is not None:
+        return rejection
+    data = request.get_json() or {}
+    ticker = format_ticker(data.get('ticker'))
+    expiry = data.get('expiry')
+    if not ticker:
+        return jsonify({'error': 'Missing ticker'}), 400
+
+    if isinstance(expiry, list):
+        expiry_dates = [e for e in expiry if e]
+    elif expiry:
+        expiry_dates = [expiry]
+    else:
+        expiry_dates = []
+
+    expiry_key = build_expiry_selection_key(expiry_dates) if expiry_dates else ''
+    cached = _options_cache.get((ticker, expiry_key), {}) if expiry_dates else {}
+    calls = cached.get('calls')
+    puts = cached.get('puts')
+
+    if calls is None or puts is None:
+        return jsonify({'error': 'No options data available — load the dashboard first'}), 404
+
+    try:
+        top_n = int(data.get('limit', 5))
+    except (TypeError, ValueError):
+        top_n = 5
+    top_n = max(1, min(top_n, 25))
+
+    today = datetime.now(pytz.timezone('US/Eastern')).date()
+
+    def _to_chip(row):
+        exp = row.get('expiration')
+        if hasattr(exp, 'strftime'):
+            exp_str = exp.strftime('%Y-%m-%d')
+            dte = (exp - today).days
+        else:
+            exp_str = str(exp) if exp else ''
+            dte = None
+        last = row.get('lastPrice') or 0.0
+        bid = row.get('bid') or 0.0
+        ask = row.get('ask') or 0.0
+        # Fall back to mid when there's no last print today (common for
+        # illiquid OTM strikes that still show OI).
+        if not last and bid > 0 and ask > 0:
+            last = (bid + ask) / 2.0
+        return {
+            'strike': float(row['strike']),
+            'expiry': exp_str,
+            'dte': dte,
+            'last': float(last),
+            'volume': int(row.get('volume', 0) or 0),
+            'open_interest': int(row.get('openInterest', 0) or 0),
+            'contract': row.get('contractSymbol', '') or '',
+        }
+
+    def _top_rows(df, n):
+        if df is None or df.empty or 'volume' not in df.columns:
+            return []
+        nz = df[df['volume'] > 0]
+        if nz.empty:
+            return []
+        return [_to_chip(r) for _, r in nz.nlargest(n, 'volume').iterrows()]
+
+    return jsonify({
+        'ticker': ticker,
+        'as_of': datetime.now().isoformat(timespec='seconds'),
+        'top_calls': _top_rows(calls, top_n),
+        'top_puts': _top_rows(puts, top_n),
+    })
 
 
 # ── Gamma Profile API ────────────────────────────────────────────────────────
