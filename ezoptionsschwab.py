@@ -17,6 +17,8 @@ import warnings
 import json
 import threading
 import queue
+import re
+import uuid
 
 
 # Load environment variables
@@ -8557,6 +8559,11 @@ def index():
                     </div>
                     <div class="alerts-control">
                         <button id="gammaProfileButton" title="Toggle gamma profile sidebar — regime, key levels, chain activity">📊 Profile</button>
+                    </div>
+                    <div class="alerts-control">
+                        <a id="scannerLink" href="/scanner" target="_blank" rel="noopener"
+                           style="display:inline-block;text-decoration:none;color:inherit;"
+                           title="Open the multi-ticker options scanner in a new tab"><button>🔍 Scanner</button></a>
                     </div>
                     <div class="alerts-control">
                         <button id="zeroDteButton" title="0DTE focus mode — lock expiry to today, narrow strike range, show only 0DTE-relevant charts">⚡ 0DTE</button>
@@ -17311,6 +17318,665 @@ def top_options():
         'top_calls': _top_rows(calls, top_n),
         'top_puts': _top_rows(puts, top_n),
     })
+
+
+# ── Options Scanner ──────────────────────────────────────────────────────────
+# Background scan jobs keyed by token. Each job carries a queue that the SSE
+# stream drains. Jobs are GC'd when the SSE generator exits.
+_scanner_jobs = {}
+_scanner_jobs_lock = threading.Lock()
+
+
+class _TaggingForwarder:
+    """Wraps a downstream queue so PriceStreamer quote events get tagged
+    with their ticker before being merged into the scanner SSE feed.
+    The PriceStreamer pushes per-ticker JSON strings to per-ticker queue
+    lists; this forwarder fans them into a single combined feed."""
+    def __init__(self, downstream, ticker):
+        self._downstream = downstream
+        self._ticker = ticker
+
+    def put_nowait(self, payload):
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get('type') != 'quote':
+            return
+        try:
+            self._downstream.put_nowait(json.dumps({
+                'type': 'quote',
+                'ticker': self._ticker,
+                'last': data.get('last'),
+            }))
+        except Exception:
+            pass
+
+
+def _scanner_compute_row(ticker, today):
+    """Fetch the nearest-expiry chain for one ticker and compute the scanner
+    row signals. Returns a dict or None if data is missing."""
+    expirations = get_option_expirations(ticker)
+    if not expirations:
+        return None
+    future = [e for e in expirations
+              if datetime.strptime(e, '%Y-%m-%d').date() >= today]
+    if not future:
+        return None
+    nearest = sorted(future)[0]
+
+    calls, puts = fetch_options_for_date(ticker, nearest)
+    if (calls is None or calls.empty) and (puts is None or puts.empty):
+        return None
+    S = get_current_price(ticker)
+    if S is None:
+        return None
+
+    call_vol = int(calls['volume'].sum()) if 'volume' in calls.columns else 0
+    put_vol = int(puts['volume'].sum()) if 'volume' in puts.columns else 0
+    call_oi = int(calls['openInterest'].sum()) if 'openInterest' in calls.columns else 0
+    put_oi = int(puts['openInterest'].sum()) if 'openInterest' in puts.columns else 0
+    total_vol = call_vol + put_vol
+    total_oi = call_oi + put_oi
+    vol_oi_ratio = (total_vol / total_oi) if total_oi > 0 else None
+    pc_ratio = (call_vol / put_vol) if put_vol > 0 else None
+    gex_magnitude = float(calls['GEX'].abs().sum()) + float(puts['GEX'].abs().sum())
+
+    ck = calls.groupby('strike')['GEX'].sum() if not calls.empty else pd.Series(dtype=float)
+    pk = puts.groupby('strike')['GEX'].sum() if not puts.empty else pd.Series(dtype=float)
+    overall_pairs = [
+        (float(K), gex_net(float(ck.get(K, 0.0)), float(pk.get(K, 0.0))))
+        for K in sorted(set(ck.index) | set(pk.index))
+    ]
+    flip = _gex_zero_crossing(overall_pairs)
+    flip_distance_pct = ((flip - S) / S * 100.0) if (flip is not None and S) else None
+
+    def _loudest(df):
+        if df is None or df.empty or 'volume' not in df.columns:
+            return None
+        nz = df[df['volume'] > 0]
+        if nz.empty:
+            return None
+        r = nz.nlargest(1, 'volume').iloc[0]
+        oi = int(r.get('openInterest', 0) or 0)
+        vol = int(r['volume'])
+        return {
+            'strike': float(r['strike']),
+            'volume': vol,
+            'oi': oi,
+            'vol_oi': (vol / oi) if oi > 0 else None,
+        }
+
+    dte = (datetime.strptime(nearest, '%Y-%m-%d').date() - today).days
+    return {
+        'ticker': ticker,
+        'spot': float(S),
+        'expiry': nearest,
+        'dte': dte,
+        'call_volume': call_vol,
+        'put_volume': put_vol,
+        'total_volume': total_vol,
+        'total_oi': total_oi,
+        'vol_oi_ratio': vol_oi_ratio,
+        'pc_ratio': pc_ratio,
+        'gex_magnitude': gex_magnitude,
+        'gamma_flip': flip,
+        'flip_distance_pct': flip_distance_pct,
+        'loudest_call': _loudest(calls),
+        'loudest_put': _loudest(puts),
+    }
+
+
+def _scanner_run(token, tickers):
+    """Worker thread: scan each ticker sequentially with a small inter-call
+    delay to stay polite with Schwab rate limits, push results to the job's
+    queue."""
+    job = _scanner_jobs.get(token)
+    if job is None:
+        return
+    q = job['queue']
+    today = datetime.now(pytz.timezone('US/Eastern')).date()
+    total = len(tickers)
+    for i, tk in enumerate(tickers):
+        progress = {'done': i + 1, 'total': total}
+        try:
+            row = _scanner_compute_row(tk, today)
+            if row is not None:
+                q.put(json.dumps({'type': 'row', 'data': row, 'progress': progress}))
+            else:
+                q.put(json.dumps({'type': 'skip', 'ticker': tk, 'progress': progress}))
+        except Exception as e:
+            q.put(json.dumps({'type': 'error', 'ticker': tk, 'error': str(e), 'progress': progress}))
+        time.sleep(0.05)
+    q.put(json.dumps({'type': 'done'}))
+    job['finished_at'] = time.time()
+
+
+@app.route('/scanner', methods=['GET'])
+def scanner_page():
+    """Standalone Options Scanner page."""
+    return render_template_string(_SCANNER_HTML)
+
+
+@app.route('/scanner/scan', methods=['POST'])
+def scanner_start():
+    """Kick off a scan over the provided ticker list. Returns a token the
+    client uses to subscribe to /scanner/stream/<token>."""
+    data = request.get_json() or {}
+    raw = data.get('tickers', '')
+    if isinstance(raw, list):
+        candidates = raw
+    else:
+        candidates = re.split(r'[\s,]+', str(raw))
+    seen = set()
+    tickers = []
+    for t in candidates:
+        norm = format_ticker((t or '').strip())
+        if norm and _validate_ticker_string(norm) and norm not in seen:
+            seen.add(norm)
+            tickers.append(norm)
+    if not tickers:
+        return jsonify({'error': 'No valid tickers provided'}), 400
+    if len(tickers) > 250:
+        return jsonify({'error': 'Cap is 250 tickers per scan'}), 400
+
+    token = uuid.uuid4().hex
+    with _scanner_jobs_lock:
+        _scanner_jobs[token] = {
+            'queue': queue.Queue(maxsize=1024),
+            'tickers': tickers,
+            'started_at': time.time(),
+            'finished_at': None,
+        }
+    threading.Thread(target=_scanner_run, args=(token, tickers), daemon=True).start()
+    return jsonify({'scan_id': token, 'count': len(tickers), 'tickers': tickers})
+
+
+@app.route('/scanner/stream/<token>')
+def scanner_stream(token):
+    """SSE feed for a scan: emits row/skip/error/done events from the worker
+    thread and live `quote` events forwarded from PriceStreamer for every
+    ticker in this scan. Subscribes price ticks for the lifetime of the
+    stream connection."""
+    job = _scanner_jobs.get(token)
+    if job is None:
+        return jsonify({'error': 'Unknown scan token'}), 404
+    q = job['queue']
+    tickers = list(job['tickers'])
+
+    forwarders = []
+    for tk in tickers:
+        f = _TaggingForwarder(q, tk)
+        forwarders.append((tk, f))
+        try:
+            price_streamer.subscribe(tk, f)
+        except Exception as e:
+            print(f"[scanner] subscribe error for {tk}: {e}")
+
+    def generate():
+        try:
+            yield 'data: {"type":"connected","tickers":' + json.dumps(tickers) + '}\n\n'
+            scan_done = False
+            # Keep streaming live quotes after scan completes — close from
+            # client side or via long heartbeat timeout.
+            while True:
+                try:
+                    payload = q.get(timeout=15)
+                    yield f'data: {payload}\n\n'
+                    try:
+                        ev = json.loads(payload)
+                        if ev.get('type') == 'done':
+                            scan_done = True
+                    except Exception:
+                        pass
+                except queue.Empty:
+                    yield 'data: {"type":"heartbeat"}\n\n'
+        except GeneratorExit:
+            pass
+        finally:
+            for tk, f in forwarders:
+                try:
+                    price_streamer.unsubscribe_queue(tk, f)
+                except Exception:
+                    pass
+            with _scanner_jobs_lock:
+                _scanner_jobs.pop(token, None)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
+
+
+# Standalone HTML for /scanner. Self-contained — no dependencies on the main
+# dashboard's CSS/JS.
+_SCANNER_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Options Scanner — EzOptions</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #1a1a1a; --panel: #232323; --border: #333;
+    --text: #eef2f7; --muted: #888; --secondary: #b9c1cb;
+    --accent: #b18cf2; --pos: #26a269; --neg: #ff5c5c;
+    --highlight: rgba(177, 140, 242, 0.12);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: Arial, sans-serif; font-size: 13px; }
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+           border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 700; }
+  header nav { margin-left: auto; }
+  header nav a { color: var(--secondary); text-decoration: none; font-size: 12px;
+                 padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; }
+  header nav a:hover { background: var(--bg); }
+
+  .layout { display: flex; gap: 14px; padding: 14px; min-height: calc(100vh - 50px); }
+  .input-pane {
+    flex: 0 0 280px; display: flex; flex-direction: column; gap: 10px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px;
+  }
+  .input-pane label { font-size: 11px; letter-spacing: 0.05em;
+                      color: var(--muted); font-weight: 700; text-transform: uppercase; }
+  textarea#tickers {
+    width: 100%; min-height: 220px; resize: vertical;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 8px; font-family: ui-monospace, monospace; font-size: 12px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row .grow { flex: 1; }
+  button.primary {
+    background: var(--accent); color: #1a1a1a; border: none;
+    padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: 700;
+  }
+  button.primary:disabled { background: #555; color: #aaa; cursor: not-allowed; }
+  button.secondary {
+    background: transparent; color: var(--secondary);
+    border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px;
+    cursor: pointer; font-size: 12px;
+  }
+  button.secondary:hover { background: var(--bg); }
+  .progress {
+    height: 4px; background: var(--bg); border-radius: 999px; overflow: hidden;
+    margin-top: 4px;
+  }
+  .progress-bar {
+    height: 100%; width: 0%; background: var(--accent);
+    transition: width 0.15s linear;
+  }
+  .legend { font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  .results-pane {
+    flex: 1; min-width: 0;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .toolbar input.filter {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 5px 8px; border-radius: 4px; font-size: 12px;
+    width: 160px;
+  }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    background: rgba(255,255,255,0.06); color: var(--secondary);
+    font-size: 11px; font-weight: 600;
+  }
+  .pill.live { background: rgba(38,162,105,0.15); color: var(--pos); }
+  .table-wrap { overflow: auto; flex: 1; }
+  table { border-collapse: collapse; width: 100%; min-width: 1100px; }
+  th, td { padding: 6px 10px; text-align: right;
+           white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th {
+    position: sticky; top: 0; z-index: 1;
+    background: var(--panel); cursor: pointer; user-select: none;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; letter-spacing: 0.04em; color: var(--muted); font-weight: 700;
+  }
+  th.sortable:hover { color: var(--text); }
+  th .sort-arrow { margin-left: 4px; opacity: 0.6; }
+  td.ticker { text-align: left; font-weight: 700; }
+  td.ticker a { color: var(--text); text-decoration: none; }
+  td.ticker a:hover { color: var(--accent); text-decoration: underline; }
+  tr:hover td { background: var(--highlight); }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  .mute { color: var(--muted); }
+  .quote-flash { animation: qflash 0.6s ease-out; }
+  @keyframes qflash { from { background: rgba(177,140,242,0.3); } to { background: transparent; } }
+  .empty {
+    padding: 40px; text-align: center; color: var(--muted); font-style: italic;
+  }
+  .errors {
+    padding: 8px 12px; font-size: 11px; color: var(--neg);
+    border-top: 1px solid var(--border);
+    max-height: 80px; overflow-y: auto;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 Options Scanner</h1>
+  <span class="pill" id="status-pill">idle</span>
+  <span class="pill" id="live-pill" style="display:none;">● LIVE</span>
+  <nav><a href="/" target="_blank" rel="noopener">← Dashboard</a></nav>
+</header>
+<div class="layout">
+  <aside class="input-pane">
+    <label for="tickers">Tickers (one per line, or comma-separated)</label>
+    <textarea id="tickers" placeholder="AAPL&#10;MSFT&#10;NVDA"></textarea>
+    <div class="row">
+      <button class="primary grow" id="scan-btn">Scan</button>
+      <button class="secondary" id="cancel-btn" disabled>Stop</button>
+    </div>
+    <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+    <div class="legend">
+      <strong>Columns</strong><br>
+      <b>V/OI</b> = (call+put volume) ÷ open interest. &gt;0.3 hints unusual flow.<br>
+      <b>P/C</b> = call vol ÷ put vol. Higher = call-heavy flow.<br>
+      <b>|GEX|</b> = total absolute gamma exposure across the chain.<br>
+      <b>FlipΔ%</b> = distance from spot to gamma flip.<br>
+      <b>Top Call/Put</b> = strike with most volume that side.
+    </div>
+    <div class="legend mute">
+      Live spot prices stream over websocket while this page is open.
+      Other columns reflect the most recent scan.
+    </div>
+  </aside>
+  <main class="results-pane">
+    <div class="toolbar">
+      <input class="filter" id="filter" placeholder="Filter ticker...">
+      <span class="pill" id="row-count">0 rows</span>
+      <button class="secondary" id="export-csv">Export CSV</button>
+      <span class="mute" id="last-update" style="margin-left:auto;font-size:11px;"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="results">
+        <thead><tr id="results-head"></tr></thead>
+        <tbody id="results-body"></tbody>
+      </table>
+      <div class="empty" id="empty-state">Paste tickers and click Scan to begin.</div>
+    </div>
+    <div class="errors" id="errors" style="display:none;"></div>
+  </main>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const COLS = [
+    {key:'ticker',  label:'Ticker',  type:'str'},
+    {key:'spot',    label:'Spot',    type:'num', fmt:fmtPrice},
+    {key:'dte',     label:'DTE',     type:'num', fmt:v=>v==null?'—':String(v)+'d'},
+    {key:'call_volume',label:'Call V', type:'num', fmt:fmtVol},
+    {key:'put_volume', label:'Put V',  type:'num', fmt:fmtVol},
+    {key:'vol_oi_ratio',label:'V/OI', type:'num', fmt:v=>v==null?'—':v.toFixed(2)},
+    {key:'pc_ratio',    label:'P/C',  type:'num', fmt:v=>v==null?'—':v.toFixed(2)},
+    {key:'gex_magnitude',label:'|GEX|', type:'num', fmt:fmtLarge},
+    {key:'flip_distance_pct',label:'FlipΔ%', type:'num', fmt:fmtSignedPct},
+    {key:'loudest_call', label:'Top Call', type:'composite', fmt:fmtLoudest},
+    {key:'loudest_put',  label:'Top Put',  type:'composite', fmt:fmtLoudest},
+    {key:'expiry',  label:'Expiry', type:'str'},
+  ];
+
+  let rows = [];           // ticker -> row
+  let rowsByTicker = {};
+  let sortKey = 'gex_magnitude';
+  let sortDir = -1;
+  let currentScanId = null;
+  let evtSrc = null;
+  let errorList = [];
+
+  function fmtPrice(n)  { return n==null||isNaN(n) ? '—' : Number(n).toFixed(2); }
+  function fmtVol(n) {
+    if (n == null || isNaN(n)) return '—';
+    const a = Math.abs(n);
+    if (a >= 1e6) return (a/1e6).toFixed(1)+'M';
+    if (a >= 1e3) return (a/1e3).toFixed(1)+'K';
+    return String(Math.round(a));
+  }
+  function fmtLarge(n) {
+    if (n == null || isNaN(n)) return '—';
+    const a = Math.abs(n), s = n < 0 ? '-' : '';
+    if (a >= 1e9) return s+(a/1e9).toFixed(2)+'B';
+    if (a >= 1e6) return s+(a/1e6).toFixed(2)+'M';
+    if (a >= 1e3) return s+(a/1e3).toFixed(2)+'K';
+    return s + a.toFixed(2);
+  }
+  function fmtSignedPct(n) {
+    if (n == null || isNaN(n)) return '—';
+    const sign = n >= 0 ? '+' : '';
+    return '<span class="' + (n >= 0 ? 'pos' : 'neg') + '">' + sign + n.toFixed(2) + '%</span>';
+  }
+  function fmtLoudest(o) {
+    if (!o) return '—';
+    const vo = o.vol_oi != null ? ' <span class="mute">'+o.vol_oi.toFixed(1)+'×</span>' : '';
+    return Math.round(o.strike) + ' <span class="mute">'+fmtVol(o.volume)+'</span>' + vo;
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function renderHead() {
+    const tr = $('results-head');
+    tr.innerHTML = COLS.map(c => {
+      const arrow = (c.key === sortKey) ? '<span class="sort-arrow">' + (sortDir > 0 ? '▲' : '▼') + '</span>' : '';
+      return '<th class="sortable" data-key="'+c.key+'">' + c.label + arrow + '</th>';
+    }).join('');
+    tr.querySelectorAll('th').forEach(th => {
+      th.addEventListener('click', () => {
+        const k = th.dataset.key;
+        if (sortKey === k) sortDir = -sortDir;
+        else { sortKey = k; sortDir = (COLS.find(c=>c.key===k).type === 'num') ? -1 : 1; }
+        renderHead(); renderBody();
+      });
+    });
+  }
+
+  function renderBody() {
+    const filter = ($('filter').value || '').toUpperCase();
+    let view = rows.slice();
+    if (filter) view = view.filter(r => (r.ticker||'').toUpperCase().includes(filter));
+    view.sort((a, b) => {
+      const av = pickSortValue(a, sortKey), bv = pickSortValue(b, sortKey);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return av < bv ? -sortDir : (av > bv ? sortDir : 0);
+    });
+    $('row-count').textContent = view.length + ' rows';
+    if (!view.length) {
+      $('results-body').innerHTML = '';
+      $('empty-state').style.display = '';
+      $('empty-state').textContent = filter ? 'No tickers match the filter.' : 'No results yet.';
+      return;
+    }
+    $('empty-state').style.display = 'none';
+    $('results-body').innerHTML = view.map(rowHtml).join('');
+  }
+  function pickSortValue(r, k) {
+    if (k === 'loudest_call' || k === 'loudest_put') return r[k] ? r[k].volume : null;
+    return r[k];
+  }
+  function rowHtml(r) {
+    return '<tr data-ticker="'+escapeHtml(r.ticker)+'">' + COLS.map(c => {
+      const v = r[c.key];
+      let cell;
+      if (c.key === 'ticker') {
+        cell = '<a href="/?ticker='+encodeURIComponent(r.ticker)+'" target="_blank" rel="noopener">'+escapeHtml(r.ticker)+'</a>';
+        return '<td class="ticker">' + cell + '</td>';
+      }
+      cell = c.fmt ? c.fmt(v) : (v == null ? '—' : escapeHtml(v));
+      const cls = (c.key === 'spot') ? ' class="spot-cell"' : '';
+      return '<td' + cls + '>' + cell + '</td>';
+    }).join('') + '</tr>';
+  }
+
+  function upsertRow(row) {
+    if (!row || !row.ticker) return;
+    const existing = rowsByTicker[row.ticker];
+    if (existing) Object.assign(existing, row);
+    else { rowsByTicker[row.ticker] = row; rows.push(row); }
+    renderBody();
+  }
+
+  function applyQuote(ticker, last) {
+    const r = rowsByTicker[ticker];
+    if (!r) return;
+    r.spot = last;
+    if (r.gamma_flip != null && last) {
+      r.flip_distance_pct = (r.gamma_flip - last) / last * 100;
+    }
+    // In-place update of just the row's cells, with a brief flash.
+    const tr = document.querySelector('tr[data-ticker="'+CSS.escape(ticker)+'"]');
+    if (!tr) return;
+    const cells = tr.querySelectorAll('td');
+    COLS.forEach((c, i) => {
+      if (c.key === 'spot' || c.key === 'flip_distance_pct') {
+        const newHtml = c.fmt ? c.fmt(r[c.key]) : (r[c.key] == null ? '—' : escapeHtml(r[c.key]));
+        if (cells[i]) {
+          cells[i].innerHTML = newHtml;
+          cells[i].classList.remove('quote-flash');
+          void cells[i].offsetWidth;
+          cells[i].classList.add('quote-flash');
+        }
+      }
+    });
+  }
+
+  function setStatus(text, live) {
+    $('status-pill').textContent = text;
+    $('live-pill').style.display = live ? '' : 'none';
+  }
+  function setProgress(done, total) {
+    if (!total) { $('progress-bar').style.width = '0%'; return; }
+    $('progress-bar').style.width = (done / total * 100).toFixed(1) + '%';
+  }
+
+  function startScan() {
+    const text = $('tickers').value || '';
+    const tickers = text.split(/[\\s,]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+    if (!tickers.length) { alert('Paste at least one ticker.'); return; }
+    if (tickers.length > 250) { alert('Cap is 250 tickers per scan.'); return; }
+
+    rows = []; rowsByTicker = {}; errorList = [];
+    $('errors').style.display = 'none'; $('errors').innerHTML = '';
+    setProgress(0, tickers.length);
+    setStatus('starting…', false);
+    $('scan-btn').disabled = true;
+    $('cancel-btn').disabled = false;
+    renderBody();
+
+    fetch('/scanner/scan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ tickers }),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { setStatus('error', false); alert(data.error); $('scan-btn').disabled = false; return; }
+      currentScanId = data.scan_id;
+      openStream(currentScanId);
+    })
+    .catch(err => { setStatus('error', false); $('scan-btn').disabled = false; alert('Failed to start scan: '+err); });
+  }
+
+  function openStream(token) {
+    if (evtSrc) { try { evtSrc.close(); } catch (e) {} }
+    evtSrc = new EventSource('/scanner/stream/' + encodeURIComponent(token));
+    evtSrc.onmessage = (msg) => {
+      let ev;
+      try { ev = JSON.parse(msg.data); } catch (e) { return; }
+      switch (ev.type) {
+        case 'connected':
+          setStatus('scanning…', true);
+          break;
+        case 'row':
+          upsertRow(ev.data);
+          if (ev.progress) setProgress(ev.progress.done, ev.progress.total);
+          $('last-update').textContent = 'last result: ' + (ev.data && ev.data.ticker || '');
+          break;
+        case 'skip':
+          if (ev.progress) setProgress(ev.progress.done, ev.progress.total);
+          break;
+        case 'error':
+          errorList.push((ev.ticker || '?') + ' — ' + (ev.error || 'failed'));
+          $('errors').innerHTML = errorList.map(e => '<div>'+escapeHtml(e)+'</div>').join('');
+          $('errors').style.display = '';
+          if (ev.progress) setProgress(ev.progress.done, ev.progress.total);
+          break;
+        case 'done':
+          setStatus('done', true);
+          $('scan-btn').disabled = false;
+          $('last-update').textContent = 'scan completed at ' + new Date().toLocaleTimeString();
+          break;
+        case 'quote':
+          if (ev.ticker) applyQuote(ev.ticker, ev.last);
+          break;
+        case 'heartbeat': break;
+      }
+    };
+    evtSrc.onerror = () => {
+      setStatus('disconnected', false);
+      $('scan-btn').disabled = false;
+      $('cancel-btn').disabled = true;
+    };
+  }
+
+  function stopScan() {
+    if (evtSrc) { try { evtSrc.close(); } catch (e) {} evtSrc = null; }
+    setStatus('stopped', false);
+    $('scan-btn').disabled = false;
+    $('cancel-btn').disabled = true;
+  }
+
+  function exportCsv() {
+    if (!rows.length) return;
+    const headers = COLS.map(c => c.label);
+    const lines = [headers.join(',')];
+    rows.forEach(r => {
+      lines.push(COLS.map(c => {
+        const v = r[c.key];
+        if (c.key === 'loudest_call' || c.key === 'loudest_put') {
+          if (!v) return '';
+          return Math.round(v.strike) + '@' + v.volume;
+        }
+        if (v == null) return '';
+        return String(v).replace(/,/g, ';');
+      }).join(','));
+    });
+    const blob = new Blob([lines.join('\\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'options_scan_' + new Date().toISOString().slice(0,10) + '.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    renderHead(); renderBody();
+    $('scan-btn').addEventListener('click', startScan);
+    $('cancel-btn').addEventListener('click', stopScan);
+    $('filter').addEventListener('input', renderBody);
+    $('export-csv').addEventListener('click', exportCsv);
+    $('tickers').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); startScan(); }
+    });
+  });
+})();
+</script>
+</body></html>
+"""
 
 
 # ── Gamma Profile API ────────────────────────────────────────────────────────
