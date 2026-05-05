@@ -14110,6 +14110,16 @@ def index():
 
         applyMobileLayoutState();
 
+        // Deep-link from /scanner: ?ticker=XYZ overrides saved-settings ticker
+        // for this page load only. We set the input here (before settings load)
+        // and applySettings respects it — see the urlTicker check there.
+        try {
+            const _urlTicker = new URLSearchParams(window.location.search).get('ticker');
+            if (_urlTicker) {
+                document.getElementById('ticker').value = _urlTicker.toUpperCase().trim();
+            }
+        } catch (e) {}
+
         // Initial load - automatically load saved settings, or use defaults
         loadSettings(false);
 
@@ -14206,7 +14216,11 @@ def index():
         }
         
         function applySettings(settings) {
-            if (settings.ticker) document.getElementById('ticker').value = settings.ticker;
+            // URL ?ticker= wins over saved settings for the current page load —
+            // lets the scanner row click deep-link to a specific ticker without
+            // saved-settings clobbering it.
+            const _urlTicker = new URLSearchParams(window.location.search).get('ticker');
+            if (settings.ticker && !_urlTicker) document.getElementById('ticker').value = settings.ticker;
             applyTheme(settings.theme || 'dark');
             if (settings.timeframe) document.getElementById('timeframe').value = settings.timeframe;
             if (settings.strike_range) {
