@@ -8,6 +8,8 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
   </a>
 </div>
 
+> **📖 [FEATURES.md](FEATURES.md)** — full reference for everything added on top of the original dashboard: strike-level alerts, Flow Pulse (Greek velocity), live IV solver, manual position P&L tracker with chart overlay, multi-profile settings, watchlist sidebar, end-of-day session reports, replay mode, and more. Each section covers what it does, how to use it, and the API surface.
+
 ## Features
 
 ### 📊 Real-Time Data

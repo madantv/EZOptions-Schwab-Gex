@@ -1178,6 +1178,61 @@ class PriceStreamer:
         self._queues = {}       # ticker (upper) -> list[queue.Queue]
         self._subscribed = set()  # tickers with active stream subscriptions
         self._started = False
+        # Per-ticker last quote (price, ts) and EMA-smoothed hedge flow state.
+        # Used to compute live dealer hedge flow $/sec on each quote tick.
+        self._last_quote = {}
+        self._hedge_ema = {}
+
+    def _compute_hedge_flow(self, ticker, last_price, now_ts):
+        """Estimate dealer hedge flow ($/sec) from price velocity and the
+        cached options chain. Returns (hedge_per_sec, velocity, cum_gex) or
+        None if insufficient data."""
+        prev = self._last_quote.get(ticker)
+        self._last_quote[ticker] = (last_price, now_ts)
+        if prev is None:
+            return None
+        prev_price, prev_ts = prev
+        dt = max(0.001, now_ts - prev_ts)
+        if dt > 30.0:
+            # Stale gap (e.g. paused stream) — discard, restart on next tick.
+            return None
+        velocity = (last_price - prev_price) / dt  # $/sec
+        if velocity == 0:
+            # No movement → no flow. Don't push noisy zeros.
+            return (0.0, 0.0, None)
+        # Pull cached chain and compute net dealer GEX over a tight ATM window.
+        cum_gex = None
+        try:
+            for (cache_t, _), cached in _options_cache.items():
+                if cache_t != ticker:
+                    continue
+                calls = cached.get('calls')
+                puts  = cached.get('puts')
+                if calls is None or puts is None:
+                    continue
+                if 'GEX' not in calls.columns or 'GEX' not in puts.columns:
+                    continue
+                lo = last_price * 0.95
+                hi = last_price * 1.05
+                rc = calls[(calls['strike'] >= lo) & (calls['strike'] <= hi)]
+                rp = puts[(puts['strike']  >= lo) & (puts['strike']  <= hi)]
+                cg = float(rc['GEX'].sum()) if not rc.empty else 0.0
+                pg = float(rp['GEX'].sum()) if not rp.empty else 0.0
+                cum_gex = pg - cg  # dealer convention
+                break
+        except Exception:
+            cum_gex = None
+        if cum_gex is None or last_price <= 0:
+            return None
+        # hedge $/sec = -cum_gex × 100 × velocity / S
+        # Sign: negative cum_gex (dealer short gamma) + positive velocity ⇒ buying.
+        hedge_raw = -cum_gex * 100.0 * velocity / last_price
+        # EMA smoothing — instantaneous tick-to-tick velocity is noisy.
+        prev_ema = self._hedge_ema.get(ticker, {}).get('value', hedge_raw)
+        alpha = 0.3
+        ema_val = alpha * hedge_raw + (1 - alpha) * prev_ema
+        self._hedge_ema[ticker] = {'value': ema_val, 'ts': now_ts}
+        return (ema_val, velocity, cum_gex)
 
     def _handler(self, message):
         """Parse raw schwabdev stream message and push candle/quote data to queues."""
@@ -1232,18 +1287,43 @@ class PriceStreamer:
                         last = item.get('3')  # field 3 = last price
                         if not ticker or last is None:
                             continue
-                        payload = json.dumps({'type': 'quote', 'last': float(last)})
+                        last_f = float(last)
+                        payload = json.dumps({'type': 'quote', 'last': last_f})
                         self._push(ticker, payload)
-                        alert_evaluator.on_price_tick(ticker, last)
+                        alert_evaluator.on_price_tick(ticker, last_f)
+                        # Live dealer hedge flow estimate (0DTE traders care
+                        # most). Only meaningful when the chain is cached for
+                        # this ticker — _compute_hedge_flow returns None otherwise.
+                        hf = self._compute_hedge_flow(ticker, last_f, time.time())
+                        if hf is not None:
+                            ema_val, vel, cg = hf
+                            self._push(ticker, json.dumps({
+                                'type': 'hedge_flow',
+                                'hedge_per_sec': ema_val,
+                                'velocity': vel,
+                                'cum_gex': cg,
+                                'last': last_f,
+                            }))
                 elif service == 'LEVELONE_FUTURES':
                     for item in msg.get('content', []):
                         ticker = item.get('key', '').upper()
                         last = item.get('3')  # field 3 = last price
                         if not ticker or last is None:
                             continue
-                        payload = json.dumps({'type': 'quote', 'last': float(last)})
+                        last_f = float(last)
+                        payload = json.dumps({'type': 'quote', 'last': last_f})
                         self._push(ticker, payload)
-                        alert_evaluator.on_price_tick(ticker, last)
+                        alert_evaluator.on_price_tick(ticker, last_f)
+                        hf = self._compute_hedge_flow(ticker, last_f, time.time())
+                        if hf is not None:
+                            ema_val, vel, cg = hf
+                            self._push(ticker, json.dumps({
+                                'type': 'hedge_flow',
+                                'hedge_per_sec': ema_val,
+                                'velocity': vel,
+                                'cum_gex': cg,
+                                'last': last_f,
+                            }))
         except Exception as e:
             print(f"[PriceStreamer] handler error: {e}")
 
@@ -4896,6 +4976,53 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                 'label': label,
             })
 
+    # Gamma flip line: the strike at which cumulative dealer GEX crosses zero.
+    # Walk strikes low → high, accumulate dealer net gamma (gex_net under the
+    # active sign convention); linearly interpolate between adjacent strikes
+    # for the precise flip price. None if no flip in the visible range.
+    gamma_flip_price = None
+    pin_strikes = []
+    if calls is not None and puts is not None and current_price:
+        try:
+            min_s = current_price * (1 - strike_range)
+            max_s = current_price * (1 + strike_range)
+            rc_g = calls[(calls['strike'] >= min_s) & (calls['strike'] <= max_s)]
+            rp_g = puts[(puts['strike']  >= min_s) & (puts['strike']  <= max_s)]
+            if 'GEX' in rc_g.columns and 'GEX' in rp_g.columns:
+                strikes_g = sorted(set(rc_g['strike'].tolist()) | set(rp_g['strike'].tolist()))
+                cum = 0.0
+                prev_K, prev_cum = None, 0.0
+                for K in strikes_g:
+                    c_v = float(rc_g.loc[rc_g['strike'] == K, 'GEX'].sum())
+                    p_v = float(rp_g.loc[rp_g['strike'] == K, 'GEX'].sum())
+                    cum += gex_net(c_v, p_v)
+                    if prev_K is not None and prev_cum * cum < 0:
+                        # Linear interpolate to find where cumulative = 0.
+                        t = -prev_cum / (cum - prev_cum)
+                        gamma_flip_price = prev_K + t * (K - prev_K)
+                        break
+                    prev_K, prev_cum = K, cum
+
+                # Pin-risk score per strike. Heuristic: higher abs(net gamma) +
+                # closer to spot + higher gamma time-sensitivity (1/sqrt(t)) →
+                # stronger magnet. We don't have per-strike t here so use a
+                # uniform time factor of 1; fold per-strike t in if future
+                # callers pass it. Top 3 strikes are surfaced for chart hilite.
+                scores = []
+                for K in strikes_g:
+                    c_v = float(rc_g.loc[rc_g['strike'] == K, 'GEX'].sum())
+                    p_v = float(rp_g.loc[rp_g['strike'] == K, 'GEX'].sum())
+                    abs_g = abs(c_v) + abs(p_v)
+                    if abs_g <= 0:
+                        continue
+                    proximity = 1.0 / (1.0 + abs(current_price - K) / max(current_price, 1.0))
+                    scores.append((K, abs_g * proximity))
+                scores.sort(key=lambda kv: kv[1], reverse=True)
+                pin_strikes = [{'strike': float(s), 'score': float(sc)} for s, sc in scores[:3]]
+        except Exception:
+            gamma_flip_price = None
+            pin_strikes = []
+
     return _json.dumps({
         'candles': lc_candles,
         'volume': lc_volume,
@@ -4911,6 +5038,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'historical_expected_moves': historical_expected_moves,
         'indicator_candles': lc_indicator_candles,
         'current_day_start_time': current_day_start_time,
+        'gamma_flip_price': gamma_flip_price,
+        'pin_strikes': pin_strikes,
     })
 
 
@@ -6149,6 +6278,89 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
         raise last_exception
 
     return combined_calls, combined_puts
+
+
+def create_delta_decay_chart(calls, puts, S, strike_range=0.02,
+                              call_color='#00FF00', put_color='#FF0000',
+                              selected_expiries=None, horizontal=False):
+    """0DTE-focused chart: $ delta unwound between now and 16:00 ET, per strike.
+
+    Charm is the rate of delta change per day; multiplying by hours_remaining/24
+    gives the projected delta unwind through session close (assuming no spot
+    movement). Useful for 0DTE traders watching dealer positioning before pin.
+
+    Charm field on each option is already in per-day exposure units (set in
+    calculate_greek_exposures), so we just rescale by remaining session hours.
+    """
+    # Hours until 16:00 ET. Cap at 8 to keep multi-day expiries from looking absurd.
+    est = pytz.timezone('US/Eastern')
+    now_et = datetime.now(est)
+    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now_et >= close_et:
+        # After hours: project for the next session (open of business day).
+        hours_remaining = 6.5
+    else:
+        hours_remaining = max(0.5, (close_et - now_et).total_seconds() / 3600.0)
+    hours_remaining = min(hours_remaining, 8.0)
+
+    min_strike = S * (1 - strike_range)
+    max_strike = S * (1 + strike_range)
+
+    range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)] if not calls.empty else calls
+    range_puts  = puts[(puts['strike'] >= min_strike)  & (puts['strike'] <= max_strike)] if not puts.empty else puts
+
+    fig = go.Figure()
+
+    if (range_calls.empty and range_puts.empty) or 'Charm' not in calls.columns:
+        fig.add_annotation(text="No charm data in range",
+                           showarrow=False, font=dict(color='#888'),
+                           xref='paper', yref='paper', x=0.5, y=0.5)
+    else:
+        scale = hours_remaining / 24.0
+        all_strikes = sorted(set(range_calls['strike'].tolist()) | set(range_puts['strike'].tolist()))
+        call_decay = []
+        put_decay = []
+        for K in all_strikes:
+            c_charm = float(range_calls.loc[range_calls['strike'] == K, 'Charm'].sum()) if not range_calls.empty else 0
+            p_charm = float(range_puts.loc[range_puts['strike']  == K, 'Charm'].sum())  if not range_puts.empty  else 0
+            call_decay.append(c_charm * scale)
+            put_decay.append(p_charm * scale)
+
+        # Diverging bars: calls to the right, puts mirrored to the left.
+        fig.add_trace(go.Bar(
+            y=all_strikes, x=call_decay, orientation='h', name='Call decay',
+            marker=dict(color=call_color),
+            hovertemplate='Strike: $%{y:.2f}<br>Call Δ unwind: %{x:,.0f}<extra></extra>',
+        ))
+        fig.add_trace(go.Bar(
+            y=all_strikes, x=[-v for v in put_decay], orientation='h', name='Put decay',
+            marker=dict(color=put_color),
+            hovertemplate='Strike: $%{y:.2f}<br>Put Δ unwind: %{x:,.0f}<extra></extra>',
+        ))
+
+        # Spot price reference line.
+        fig.add_hline(y=S, line_dash='dot', line_color='#aaa', line_width=1, opacity=0.6,
+                      annotation_text=f'spot ${S:.2f}', annotation_position='right')
+
+    fig.update_layout(
+        title=build_left_aligned_title(
+            f'Δ Decay — projected unwind through close ({hours_remaining:.1f}h remaining)',
+            y=0.98,
+        ),
+        xaxis=dict(title='$ Δ unwind (negative = puts)', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True, zeroline=True, zerolinecolor='#666'),
+        yaxis=dict(title='Strike', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=70, r=50, t=50, b=50),
+        barmode='overlay',
+        showlegend=False,
+        autosize=True,
+    )
+    return fig.to_json()
 
 
 def create_flow_pulse_chart(ticker, expiry_dates=None, lookback_minutes=15,
@@ -8084,6 +8296,9 @@ def index():
                     <div class="alerts-control">
                         <button id="watchlistButton" title="Toggle multi-ticker watchlist sidebar">📋 Watchlist <span id="watchlistBadge" class="alerts-badge" style="display:none;">0</span></button>
                     </div>
+                    <div class="alerts-control">
+                        <button id="zeroDteButton" title="0DTE focus mode — lock expiry to today, narrow strike range, show only 0DTE-relevant charts">⚡ 0DTE</button>
+                    </div>
                     <div class="control-group theme-control">
                         <label for="theme_select">Theme:</label>
                         <select id="theme_select" title="Choose a site theme">
@@ -8296,6 +8511,10 @@ def index():
                 <label for="flow_pulse">Flow Pulse (ΔGEX)</label>
             </div>
             <div class="chart-checkbox">
+                <input type="checkbox" id="delta_decay">
+                <label for="delta_decay">Δ Decay (0DTE)</label>
+            </div>
+            <div class="chart-checkbox">
                 <input type="checkbox" id="centroid" checked>
                 <label for="centroid">Call vs Put Centroid Map</label>
             </div>
@@ -8366,6 +8585,7 @@ def index():
         // TradingView Lightweight Charts instances for the price chart
         let tvPriceChart = null;
         let tvCandleSeries = null;
+        let tvLeftMirrorSeries = null;
         let tvVolumeSeries = null;
         let tvResizeObserver = null;
         // Indicator series references
@@ -9110,6 +9330,7 @@ def index():
                     tvPriceChart.timeScale().fitContent();
                     // Reset Y-axis: re-enable auto-scaling (user dragging the price axis locks it to manual mode)
                     tvPriceChart.priceScale('right').applyOptions({ autoScale: true });
+                    try { tvPriceChart.priceScale('left').applyOptions({ autoScale: true }); } catch(e) {}
                     // Re-arm the autoscaleInfoProvider so level lines are included in the Y range
                     tvApplyAutoscale();
                     // Sub-pane charts also need their price axes reset
@@ -9146,6 +9367,12 @@ def index():
             priceEventSource.onmessage = function(event) {
                 try {
                     const msg = JSON.parse(event.data);
+                    // Hedge flow updates can arrive before any candle is rendered;
+                    // they don't depend on the chart series.
+                    if (msg.type === 'hedge_flow') {
+                        applyHedgeFlow(msg);
+                        return;
+                    }
                     if (!tvCandleSeries || !tvLastCandles.length) return;
                     if (msg.type === 'quote' && typeof msg.last === 'number') {
                         applyRealtimeQuote(msg.last);
@@ -9159,6 +9386,36 @@ def index():
                 // Browser will auto-reconnect on error; just log it quietly
                 console.debug('[PriceStream] Connection error – browser will retry.');
             };
+        }
+
+        // Format $/sec for hedge flow display: e.g. "+$240k/s buy" or "-$1.2M/s sell".
+        function formatHedgeFlow(n) {
+            if (n == null || isNaN(n)) return '$—/s';
+            const abs = Math.abs(n);
+            const sign = n > 0 ? '+' : (n < 0 ? '−' : '');
+            let str;
+            if (abs >= 1e9)      str = (abs / 1e9).toFixed(2)  + 'B';
+            else if (abs >= 1e6) str = (abs / 1e6).toFixed(2)  + 'M';
+            else if (abs >= 1e3) str = (abs / 1e3).toFixed(1)  + 'k';
+            else                 str = abs.toFixed(0);
+            return sign + '$' + str + '/s';
+        }
+
+        function applyHedgeFlow(msg) {
+            const cell = document.querySelector('[data-hedge-flow]');
+            if (!cell) return;
+            const v = msg.hedge_per_sec;
+            if (typeof v !== 'number') return;
+            cell.textContent = formatHedgeFlow(v);
+            // > 0 = dealer buying (call colour); < 0 = dealer selling (put colour).
+            // |v| < $1k/s → neutral (dim).
+            if (Math.abs(v) < 1000) {
+                cell.style.color = 'var(--text-muted, #888)';
+            } else if (v > 0) {
+                cell.style.color = (typeof callColor !== 'undefined' && callColor) ? callColor : '#26a269';
+            } else {
+                cell.style.color = (typeof putColor !== 'undefined' && putColor) ? putColor : '#c33';
+            }
         }
 
         /**
@@ -10943,6 +11200,11 @@ def index():
                 if (priceInfoEl) {
                     const cpLine = priceInfoEl.querySelector('[data-live-price]');
                     if (cpLine) cpLine.textContent = '$—';
+                    const hf = priceInfoEl.querySelector('[data-hedge-flow]');
+                    if (hf) {
+                        hf.textContent = '$—/s';
+                        hf.style.color = 'var(--text-muted, #888)';
+                    }
                 }
                 // Wipe the previous ticker's exposure level lines so they don't
                 // linger until the new /update_price response arrives.
@@ -11000,7 +11262,8 @@ def index():
                 show_large_trades: document.getElementById('large_trades').checked,
                 show_premium: document.getElementById('premium').checked,
                 show_centroid: document.getElementById('centroid').checked,
-                show_flow_pulse: document.getElementById('flow_pulse').checked
+                show_flow_pulse: document.getElementById('flow_pulse').checked,
+                show_delta_decay: document.getElementById('delta_decay').checked
             };
 
             // Common payload fields shared by both requests
@@ -12613,6 +12876,12 @@ def index():
                         scaleMargins: { top: 0.04, bottom: 0.15 },
                         minimumWidth: 72,
                     },
+                    leftPriceScale: {
+                        visible:      true,
+                        borderColor:  getThemeValue('--border-color', '#333333'),
+                        scaleMargins: { top: 0.04, bottom: 0.15 },
+                        minimumWidth: 72,
+                    },
                     localization: {
                         timeFormatter: (time) => {
                             const d = new Date(time * 1000);
@@ -12645,6 +12914,19 @@ def index():
                     borderVisible: false,
                     wickUpColor:   upColor,
                     wickDownColor: downColor,
+                });
+
+                // Invisible mirror series bound to the LEFT price scale.
+                // Lightweight Charts only renders price ticks for a scale that
+                // has at least one series; this mirror lets the left axis show
+                // the same price labels as the right without painting an extra line.
+                tvLeftMirrorSeries = tvPriceChart.addLineSeries({
+                    priceScaleId: 'left',
+                    color: 'rgba(0,0,0,0)',
+                    lineWidth: 0.001,
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
                 });
 
                 tvVolumeSeries = tvPriceChart.addHistogramSeries({
@@ -12727,6 +13009,10 @@ def index():
             const isFirstRender = !tvLastCandles.length;
 
             tvCandleSeries.setData(candles);
+            // Mirror candle closes to the left price scale so it shows price ticks.
+            if (tvLeftMirrorSeries) {
+                tvLeftMirrorSeries.setData(candles.map(c => ({ time: c.time, value: c.close })));
+            }
             tvLastCandles = candles;
             tvVolumeSeries.setData(priceData.volume || []);
             // Use multi-day candles for indicator warmup so SMA200, EMA200, etc. start from day open
@@ -12775,6 +13061,43 @@ def index():
                 }
             });
 
+            // Gamma flip line — bold solid line at the strike where dealer
+            // cumulative GEX crosses zero. Above = positive-gamma regime
+            // (vol damped), below = negative (vol amplified).
+            if (typeof priceData.gamma_flip_price === 'number') {
+                try {
+                    const pl = tvCandleSeries.createPriceLine({
+                        price: priceData.gamma_flip_price,
+                        color: '#ffaa33',  // amber — distinct from call/put colours
+                        lineWidth: 3,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: 'γ Flip $' + priceData.gamma_flip_price.toFixed(2),
+                    });
+                    tvExposurePriceLines.push(pl);
+                    tvAllLevelPrices.push(priceData.gamma_flip_price);
+                } catch (e) { console.warn('γ flip render failed:', e); }
+            }
+
+            // Pin-risk magnet strikes — top 3 by score. Distinct dotted lines
+            // in a violet "magnet" colour so they stand out vs GEX walls.
+            const pinStrikes = priceData.pin_strikes || [];
+            pinStrikes.forEach((p, idx) => {
+                if (typeof p.strike !== 'number') return;
+                try {
+                    const pl = tvCandleSeries.createPriceLine({
+                        price: p.strike,
+                        color: '#b48cff',
+                        lineWidth: idx === 0 ? 2 : 1,
+                        lineStyle: LightweightCharts.LineStyle.LargeDashed,
+                        axisLabelVisible: true,
+                        title: '🧲 Pin #' + (idx + 1) + ' $' + p.strike.toFixed(2),
+                    });
+                    tvExposurePriceLines.push(pl);
+                    tvAllLevelPrices.push(p.strike);
+                } catch (e) { console.warn('pin strike render failed:', e); }
+            });
+
             tvApplyAutoscale();
             if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
 
@@ -12785,6 +13108,7 @@ def index():
                     try {
                         _chart.timeScale().fitContent();
                         _chart.priceScale('right').applyOptions({ autoScale: true });
+                        try { _chart.priceScale('left').applyOptions({ autoScale: true }); } catch(e) {}
                         tvApplyAutoscale();
                         if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
                         if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
@@ -12965,7 +13289,8 @@ def index():
                 large_trades: document.getElementById('large_trades').checked,
                 premium: document.getElementById('premium').checked,
                 centroid: document.getElementById('centroid').checked,
-                flow_pulse: document.getElementById('flow_pulse').checked
+                flow_pulse: document.getElementById('flow_pulse').checked,
+                delta_decay: document.getElementById('delta_decay').checked
             };
 
             function resizeRegularCharts() {
@@ -13032,6 +13357,7 @@ def index():
                     tvPriceChart.remove();
                     tvPriceChart = null;
                     tvCandleSeries = null;
+                    tvLeftMirrorSeries = null;
                     tvVolumeSeries = null;
                     tvIndicatorSeries = {};
                     tvHistoricalPoints = [];
@@ -13246,6 +13572,10 @@ def index():
                     <span>${expiryText}</span>
                 </div>
                 ${gexRegimeHtml}
+                <div class="price-info-item" title="Estimated dealer hedge flow ($/sec). Positive = buying, negative = selling. Updates on every price tick from cumulative dealer GEX × velocity / S.">
+                    <strong>Hedge Flow</strong>
+                    <span data-hedge-flow style="color:var(--text-muted, #888)">$—/s</span>
+                </div>
             `;
         }
         
@@ -13576,7 +13906,8 @@ def index():
                     large_trades: document.getElementById('large_trades').checked,
                     premium: document.getElementById('premium').checked,
                     centroid: document.getElementById('centroid').checked,
-                    flow_pulse: document.getElementById('flow_pulse').checked
+                    flow_pulse: document.getElementById('flow_pulse').checked,
+                    delta_decay: document.getElementById('delta_decay').checked
                 }
             };
         }
@@ -14356,6 +14687,126 @@ def index():
     </script>
 
     <!-- ── Watchlist sidebar ─────────────────────────────────────────────────── -->
+    <!-- ── 0DTE focus mode ───────────────────────────────────────────────── -->
+    <style>
+        #zeroDteButton.active {
+            background: linear-gradient(180deg, #ffaa33, #d97706) !important;
+            color: #1a1a1a !important;
+            box-shadow: 0 0 12px rgba(255, 170, 51, 0.5);
+            font-weight: 700;
+        }
+    </style>
+    <script>
+    (function () {
+        // Snapshot of pre-0DTE settings so we can restore on toggle off.
+        let zeroDteSnapshot = null;
+
+        // Charts that stay visible in 0DTE mode. Everything else gets unchecked.
+        const ZERO_DTE_CHARTS = ['price', 'gamma', 'flow_pulse', 'delta_decay'];
+
+        function isToday(dateStr) {
+            const today = new Date();
+            const y = today.getFullYear();
+            const m = String(today.getMonth() + 1).padStart(2, '0');
+            const d = String(today.getDate()).padStart(2, '0');
+            return dateStr.startsWith(`${y}-${m}-${d}`);
+        }
+
+        function pickTodayOrNearestExpiry() {
+            const checkboxes = Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]'));
+            if (!checkboxes.length) return null;
+            const today = checkboxes.find(cb => isToday(cb.value));
+            if (today) return today.value;
+            // Fall back to nearest future expiry.
+            const now = new Date();
+            const futures = checkboxes
+                .map(cb => ({ cb, d: new Date(cb.value) }))
+                .filter(x => x.d >= now)
+                .sort((a, b) => a.d - b.d);
+            return futures.length ? futures[0].cb.value : checkboxes[0].value;
+        }
+
+        function applyZeroDtePreset() {
+            // Capture current state to restore later.
+            zeroDteSnapshot = {
+                strike_range: document.getElementById('strike_range').value,
+                expiry_values: Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(cb => cb.value),
+                charts: {},
+            };
+            const allChartIds = ['price','gamma','heatmap','delta','vanna','charm','speed','vomma','color',
+                                 'options_volume','open_interest','volume','large_trades','premium','centroid',
+                                 'flow_pulse','delta_decay'];
+            allChartIds.forEach(id => {
+                const cb = document.getElementById(id);
+                if (cb) zeroDteSnapshot.charts[id] = cb.checked;
+            });
+
+            // Tighten strike range to 2%.
+            const sr = document.getElementById('strike_range');
+            if (sr) {
+                sr.value = '2';
+                const v = document.getElementById('strike_range_value');
+                if (v) v.textContent = '2%';
+            }
+
+            // Lock expiry to today (or nearest).
+            const target = pickTodayOrNearestExpiry();
+            document.querySelectorAll('.expiry-option input[type="checkbox"]').forEach(cb => {
+                cb.checked = (cb.value === target);
+            });
+            if (typeof updateExpiryDisplay === 'function') updateExpiryDisplay();
+
+            // Toggle charts: only the 0DTE set stays on.
+            allChartIds.forEach(id => {
+                const cb = document.getElementById(id);
+                if (cb) cb.checked = ZERO_DTE_CHARTS.includes(id);
+            });
+            if (typeof syncMobilePanelButtons === 'function') syncMobilePanelButtons();
+
+            document.getElementById('zeroDteButton').classList.add('active');
+            if (typeof updateData === 'function') updateData();
+        }
+
+        function restoreFromZeroDte() {
+            if (!zeroDteSnapshot) {
+                document.getElementById('zeroDteButton').classList.remove('active');
+                return;
+            }
+            const sr = document.getElementById('strike_range');
+            if (sr && zeroDteSnapshot.strike_range != null) {
+                sr.value = zeroDteSnapshot.strike_range;
+                const v = document.getElementById('strike_range_value');
+                if (v) v.textContent = sr.value + '%';
+            }
+            const wanted = new Set(zeroDteSnapshot.expiry_values || []);
+            document.querySelectorAll('.expiry-option input[type="checkbox"]').forEach(cb => {
+                cb.checked = wanted.has(cb.value);
+            });
+            if (typeof updateExpiryDisplay === 'function') updateExpiryDisplay();
+
+            Object.entries(zeroDteSnapshot.charts).forEach(([id, val]) => {
+                const cb = document.getElementById(id);
+                if (cb) cb.checked = val;
+            });
+            if (typeof syncMobilePanelButtons === 'function') syncMobilePanelButtons();
+
+            zeroDteSnapshot = null;
+            document.getElementById('zeroDteButton').classList.remove('active');
+            if (typeof updateData === 'function') updateData();
+        }
+
+        function toggleZeroDte() {
+            if (zeroDteSnapshot) restoreFromZeroDte();
+            else applyZeroDtePreset();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = document.getElementById('zeroDteButton');
+            if (btn) btn.addEventListener('click', toggleZeroDte);
+        });
+    })();
+    </script>
+
     <aside id="watchlist-sidebar" aria-label="Watchlist">
         <div class="wl-header">
             <strong>📋 Watchlist</strong>
@@ -14998,6 +15449,13 @@ def update():
                 ticker, expiry_dates=expiry_dates, lookback_minutes=15,
                 strike_range=strike_range, latest_price=S,
                 call_color=call_color, put_color=put_color,
+            )
+
+        if data.get('show_delta_decay', False):
+            response['delta_decay'] = create_delta_decay_chart(
+                calls, puts, S, strike_range=strike_range,
+                call_color=call_color, put_color=put_color,
+                selected_expiries=expiry_dates,
             )
 
         
