@@ -224,6 +224,19 @@ def init_db():
                 )
             ''')
 
+            # Saved ticker lists for the Options Scanner. tickers_json holds the
+            # ordered list as JSON so we keep the user's pasted order and can
+            # restore it verbatim across server restarts.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scanner_lists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    tickers_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            ''')
+
             # End-of-day session reports. One row per (date, ticker). summary_json
             # stores the full computed report; the columns mirror its key fields
             # so they're queryable directly without parsing JSON.
@@ -17594,6 +17607,98 @@ def scanner_stream(token):
     )
 
 
+def _normalize_list_name(name):
+    """Trim whitespace, enforce length + safe-characters. Returns the cleaned
+    name or None when invalid."""
+    name = (name or '').strip()
+    if not name or len(name) > 64:
+        return None
+    if not all(c.isalnum() or c in ' -_.' for c in name):
+        return None
+    return name
+
+
+def _normalize_ticker_list(raw):
+    """Accept a string (one-per-line, comma- or whitespace-separated) or list,
+    return a deduped list of normalized ticker strings."""
+    if isinstance(raw, list):
+        candidates = raw
+    else:
+        candidates = re.split(r'[\s,]+', str(raw or ''))
+    seen = set()
+    out = []
+    for t in candidates:
+        norm = format_ticker((t or '').strip())
+        if norm and _validate_ticker_string(norm) and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+@app.route('/scanner/lists', methods=['GET'])
+def scanner_lists_index():
+    """Return saved scanner lists ordered by most-recently-updated."""
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                'SELECT name, tickers_json, created_at, updated_at '
+                'FROM scanner_lists ORDER BY updated_at DESC'
+            )
+            rows = cur.fetchall()
+    out = []
+    for name, tj, c_at, u_at in rows:
+        try:
+            tickers = json.loads(tj)
+        except Exception:
+            tickers = []
+        out.append({
+            'name': name, 'tickers': tickers, 'count': len(tickers),
+            'created_at': c_at, 'updated_at': u_at,
+        })
+    return jsonify({'lists': out})
+
+
+@app.route('/scanner/lists', methods=['POST'])
+def scanner_lists_save():
+    """Upsert a scanner list. Body: {name, tickers}. Replaces existing
+    list of the same name (case-sensitive)."""
+    data = request.get_json() or {}
+    name = _normalize_list_name(data.get('name'))
+    if not name:
+        return jsonify({'error': 'Name must be 1-64 chars, letters/digits/space/dash/underscore/dot'}), 400
+    tickers = _normalize_ticker_list(data.get('tickers', ''))
+    if not tickers:
+        return jsonify({'error': 'Provide at least one valid ticker'}), 400
+    if len(tickers) > 250:
+        return jsonify({'error': 'Cap is 250 tickers per list'}), 400
+    now = int(time.time())
+    payload = json.dumps(tickers)
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """INSERT INTO scanner_lists (name, tickers_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                       tickers_json = excluded.tickers_json,
+                       updated_at   = excluded.updated_at""",
+                (name, payload, now, now),
+            )
+            conn.commit()
+    return jsonify({'ok': True, 'name': name, 'count': len(tickers)})
+
+
+@app.route('/scanner/lists/<path:name>', methods=['DELETE'])
+def scanner_lists_delete(name):
+    norm = _normalize_list_name(name)
+    if not norm:
+        return jsonify({'error': 'Invalid list name'}), 400
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute('DELETE FROM scanner_lists WHERE name = ?', (norm,))
+            conn.commit()
+            return jsonify({'ok': True, 'rows': cur.rowcount})
+
+
 # Standalone HTML for /scanner. Self-contained — no dependencies on the main
 # dashboard's CSS/JS.
 _SCANNER_HTML = """<!doctype html>
@@ -17637,6 +17742,11 @@ _SCANNER_HTML = """<!doctype html>
     background: var(--bg); border: 1px solid var(--border); color: var(--text);
     border-radius: 4px; padding: 8px; font-family: ui-monospace, monospace; font-size: 12px;
   }
+  .input-pane select, .input-pane input[type="text"], #list-name {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 6px 8px; font-size: 12px; min-width: 0;
+  }
+  .input-pane select:focus, #list-name:focus { outline: 1px solid var(--accent); }
   .row { display: flex; gap: 8px; align-items: center; }
   .row .grow { flex: 1; }
   button.primary {
@@ -17722,6 +17832,18 @@ _SCANNER_HTML = """<!doctype html>
 </header>
 <div class="layout">
   <aside class="input-pane">
+    <label>Saved lists</label>
+    <div class="row">
+      <select id="saved-lists" class="grow">
+        <option value="">— none —</option>
+      </select>
+      <button class="secondary" id="delete-list-btn" title="Delete selected list" disabled>×</button>
+    </div>
+    <div class="row">
+      <input id="list-name" class="grow" placeholder="List name" maxlength="64">
+      <button class="secondary" id="save-list-btn" title="Save current ticker list under this name">Save</button>
+    </div>
+
     <label for="tickers">Tickers (one per line, or comma-separated)</label>
     <textarea id="tickers" placeholder="AAPL&#10;MSFT&#10;NVDA"></textarea>
     <div class="row">
@@ -18026,6 +18148,73 @@ _SCANNER_HTML = """<!doctype html>
     URL.revokeObjectURL(url);
   }
 
+  // ── Saved lists ──────────────────────────────────────────────────────────
+  // Server-persisted (SQLite). Survives restarts. `_savedLists` mirrors the
+  // most recent fetch so we can restore the textarea + name field on select.
+  let _savedLists = [];
+  const LAST_USED_KEY = 'scannerLastUsedList';
+
+  function refreshSavedLists(selectedName) {
+    return fetch('/scanner/lists')
+      .then(r => r.json())
+      .then(data => {
+        _savedLists = (data && data.lists) || [];
+        const sel = $('saved-lists');
+        const prev = selectedName != null ? selectedName : sel.value;
+        sel.innerHTML = '<option value="">— none —</option>' + _savedLists.map(l =>
+          '<option value="' + escapeHtml(l.name) + '">' + escapeHtml(l.name) + ' (' + l.count + ')</option>'
+        ).join('');
+        if (prev && _savedLists.some(l => l.name === prev)) sel.value = prev;
+        $('delete-list-btn').disabled = !sel.value;
+      })
+      .catch(() => {});
+  }
+
+  function loadSelectedList() {
+    const name = $('saved-lists').value;
+    $('delete-list-btn').disabled = !name;
+    if (!name) return;
+    const item = _savedLists.find(l => l.name === name);
+    if (!item) return;
+    $('tickers').value = (item.tickers || []).join('\\n');
+    $('list-name').value = item.name;
+    try { localStorage.setItem(LAST_USED_KEY, item.name); } catch (e) {}
+  }
+
+  function saveCurrentList() {
+    const name = ($('list-name').value || '').trim();
+    if (!name) { alert('Enter a name to save the current ticker list under.'); $('list-name').focus(); return; }
+    const tickers = ($('tickers').value || '').split(/[\\s,]+/).map(s => s.trim()).filter(Boolean);
+    if (!tickers.length) { alert('Paste at least one ticker before saving.'); return; }
+    fetch('/scanner/lists', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, tickers }),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { alert('Save failed: ' + data.error); return; }
+      try { localStorage.setItem(LAST_USED_KEY, data.name); } catch (e) {}
+      refreshSavedLists(data.name);
+    })
+    .catch(err => alert('Save failed: ' + err));
+  }
+
+  function deleteSelectedList() {
+    const name = $('saved-lists').value;
+    if (!name) return;
+    if (!confirm('Delete the saved list "' + name + '"?')) return;
+    fetch('/scanner/lists/' + encodeURIComponent(name), { method: 'DELETE' })
+      .then(r => r.json())
+      .then(() => {
+        try {
+          if (localStorage.getItem(LAST_USED_KEY) === name) localStorage.removeItem(LAST_USED_KEY);
+        } catch (e) {}
+        refreshSavedLists('');
+        $('list-name').value = '';
+      })
+      .catch(err => alert('Delete failed: ' + err));
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     renderHead(); renderBody();
     $('scan-btn').addEventListener('click', startScan);
@@ -18034,6 +18223,20 @@ _SCANNER_HTML = """<!doctype html>
     $('export-csv').addEventListener('click', exportCsv);
     $('tickers').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); startScan(); }
+    });
+    $('save-list-btn').addEventListener('click', saveCurrentList);
+    $('delete-list-btn').addEventListener('click', deleteSelectedList);
+    $('saved-lists').addEventListener('change', loadSelectedList);
+
+    // Restore last-used list on page load — gives a "did I leave it like
+    // this?" feel across restarts without forcing the user to pick again.
+    let lastUsed = '';
+    try { lastUsed = localStorage.getItem(LAST_USED_KEY) || ''; } catch (e) {}
+    refreshSavedLists(lastUsed).then(() => {
+      if (lastUsed && _savedLists.some(l => l.name === lastUsed)) {
+        $('saved-lists').value = lastUsed;
+        loadSelectedList();
+      }
     });
   });
 })();
