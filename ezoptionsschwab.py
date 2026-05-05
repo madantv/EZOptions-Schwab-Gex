@@ -17610,16 +17610,21 @@ _SCANNER_HTML = """<!doctype html>
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
-               font-family: Arial, sans-serif; font-size: 13px; }
+               font-family: Arial, sans-serif; font-size: 13px; height: 100%; }
+  body { display: flex; flex-direction: column; overflow: hidden; }
   header { display: flex; align-items: center; gap: 14px; padding: 10px 18px;
-           border-bottom: 1px solid var(--border); background: var(--panel); }
+           border-bottom: 1px solid var(--border); background: var(--panel);
+           flex: 0 0 auto; }
   header h1 { margin: 0; font-size: 16px; font-weight: 700; }
   header nav { margin-left: auto; }
   header nav a { color: var(--secondary); text-decoration: none; font-size: 12px;
                  padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; }
   header nav a:hover { background: var(--bg); }
 
-  .layout { display: flex; gap: 14px; padding: 14px; min-height: calc(100vh - 50px); }
+  .layout {
+    display: flex; gap: 14px; padding: 14px;
+    flex: 1; min-height: 0;
+  }
   .input-pane {
     flex: 0 0 280px; display: flex; flex-direction: column; gap: 10px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
@@ -17656,10 +17661,11 @@ _SCANNER_HTML = """<!doctype html>
   .legend { font-size: 11px; color: var(--muted); line-height: 1.5; }
 
   .results-pane {
-    flex: 1; min-width: 0;
+    flex: 1; min-width: 0; min-height: 0;
     background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
     overflow: hidden; display: flex; flex-direction: column;
   }
+  .input-pane { overflow-y: auto; max-height: 100%; }
   .toolbar {
     display: flex; align-items: center; gap: 10px; padding: 8px 12px;
     border-bottom: 1px solid var(--border); flex-wrap: wrap;
@@ -17680,9 +17686,10 @@ _SCANNER_HTML = """<!doctype html>
   th, td { padding: 6px 10px; text-align: right;
            white-space: nowrap; font-variant-numeric: tabular-nums; }
   th {
-    position: sticky; top: 0; z-index: 1;
+    position: sticky; top: 0; z-index: 2;
     background: var(--panel); cursor: pointer; user-select: none;
     border-bottom: 1px solid var(--border);
+    box-shadow: 0 1px 0 var(--border);
     font-size: 11px; letter-spacing: 0.04em; color: var(--muted); font-weight: 700;
   }
   th.sortable:hover { color: var(--text); }
