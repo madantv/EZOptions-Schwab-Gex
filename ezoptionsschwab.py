@@ -8297,6 +8297,9 @@ def index():
                         <button id="watchlistButton" title="Toggle multi-ticker watchlist sidebar">📋 Watchlist <span id="watchlistBadge" class="alerts-badge" style="display:none;">0</span></button>
                     </div>
                     <div class="alerts-control">
+                        <button id="gammaProfileButton" title="Toggle gamma profile sidebar — regime, key levels, chain activity">📊 Profile</button>
+                    </div>
+                    <div class="alerts-control">
                         <button id="zeroDteButton" title="0DTE focus mode — lock expiry to today, narrow strike range, show only 0DTE-relevant charts">⚡ 0DTE</button>
                     </div>
                     <div class="control-group theme-control">
@@ -14987,6 +14990,538 @@ def index():
     })();
     </script>
 
+    <!-- ── Gamma Profile sidebar ─────────────────────────────────────────────── -->
+    <aside id="gp-sidebar" aria-label="Gamma Profile">
+        <div class="gp-header">
+            <strong>📊 Gamma Profile</strong>
+            <button id="gp-close" aria-label="Close">×</button>
+        </div>
+        <div class="gp-body">
+            <div class="gp-card gp-date-card">
+                <div class="gp-date-row">
+                    <span class="gp-date-icon">∑</span>
+                    <span id="gp-date">—</span>
+                </div>
+                <div class="gp-dte-pills">
+                    <span id="gp-dte-pill" class="gp-pill gp-pill-mute" style="display:none;">—</span>
+                    <span id="gp-dte-zero" class="gp-pill gp-pill-warn" style="display:none;">0DTE</span>
+                </div>
+            </div>
+
+            <div class="gp-card gp-totals-card">
+                <div class="gp-stat">
+                    <div class="gp-stat-label">GEX</div>
+                    <div class="gp-stat-value" id="gp-gex">—</div>
+                </div>
+                <div class="gp-stat">
+                    <div class="gp-stat-label">DEX</div>
+                    <div class="gp-stat-value" id="gp-dex">—</div>
+                </div>
+            </div>
+
+            <div class="gp-card gp-regime-card">
+                <div class="gp-regime-head">
+                    <span class="gp-regime-dot" id="gp-regime-dot">●</span>
+                    <div>
+                        <div class="gp-card-title">GAMMA PROFILE</div>
+                        <div class="gp-regime-label" id="gp-regime-label">—</div>
+                    </div>
+                </div>
+                <div class="gp-regime-desc" id="gp-regime-desc">—</div>
+                <div class="gp-levels" id="gp-levels"></div>
+            </div>
+
+            <div class="gp-card gp-chain-card">
+                <div class="gp-chain-head">
+                    <span class="gp-card-title">📈 CHAIN ACTIVITY</span>
+                    <span class="gp-chain-note" title="Vol/OI imbalance reflects positioning, not direction">ⓘ not a directional signal</span>
+                </div>
+                <div class="gp-chain-side" id="gp-chain-side">CALLS</div>
+                <div class="gp-chain-sub">vol/OI</div>
+                <div class="gp-gauge">
+                    <div class="gp-gauge-track"></div>
+                    <div class="gp-gauge-thumb" id="gp-gauge-thumb"></div>
+                    <div class="gp-gauge-labels">
+                        <span>PUTS</span>
+                        <span>BALANCED</span>
+                        <span>CALLS</span>
+                    </div>
+                </div>
+                <div class="gp-ratio-row">
+                    <div class="gp-ratio-cell">
+                        <div class="gp-ratio-label">VOL</div>
+                        <div class="gp-ratio-value" id="gp-vol-ratio">—</div>
+                    </div>
+                    <div class="gp-ratio-cell">
+                        <div class="gp-ratio-label">OI</div>
+                        <div class="gp-ratio-value" id="gp-oi-ratio">—</div>
+                    </div>
+                </div>
+                <div class="gp-bar-block">
+                    <div class="gp-bar-label">VOL</div>
+                    <div class="gp-bar"><div class="gp-bar-fill gp-bar-call" id="gp-vol-bar-call"></div></div>
+                    <div class="gp-bar-foot">
+                        <span id="gp-vol-call">—</span>
+                        <span id="gp-vol-put">—</span>
+                    </div>
+                </div>
+                <div class="gp-bar-block">
+                    <div class="gp-bar-label">OI</div>
+                    <div class="gp-bar"><div class="gp-bar-fill gp-bar-call" id="gp-oi-bar-call"></div></div>
+                    <div class="gp-bar-foot">
+                        <span id="gp-oi-call">—</span>
+                        <span id="gp-oi-put">—</span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="gp-error" class="gp-empty" style="display:none;"></div>
+        </div>
+    </aside>
+
+    <style>
+        #gp-sidebar {
+            position: fixed; top: 0; left: 0; bottom: 0; width: 290px;
+            background: var(--panel-bg, #1a1a1a); color: var(--text-primary, #eef2f7);
+            border-right: 1px solid var(--border-color, #333);
+            box-shadow: 4px 0 16px rgba(0,0,0,0.45);
+            z-index: 8500;
+            transform: translateX(-100%);
+            transition: transform 0.2s ease-out;
+            display: flex; flex-direction: column;
+            font-family: Arial, sans-serif;
+        }
+        #gp-sidebar.open { transform: translateX(0); }
+        #gp-sidebar .gp-header {
+            padding: 12px 14px; display: flex; justify-content: space-between;
+            align-items: center; border-bottom: 1px solid var(--border-color, #333);
+            font-size: 14px;
+        }
+        #gp-sidebar .gp-header button {
+            background: transparent; border: none; color: var(--text-secondary, #ccc);
+            font-size: 22px; cursor: pointer;
+        }
+        #gp-sidebar .gp-body { flex: 1; overflow-y: auto; padding: 10px; }
+
+        #gp-sidebar .gp-card {
+            background: var(--panel-bg-alt, #232323);
+            border: 1px solid var(--border-color, #333);
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+        }
+        #gp-sidebar .gp-card-title {
+            font-size: 10px;
+            letter-spacing: 0.08em;
+            color: var(--text-muted, #888);
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+
+        #gp-sidebar .gp-date-card {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 8px 12px;
+        }
+        #gp-sidebar .gp-date-row { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
+        #gp-sidebar .gp-date-icon {
+            color: #b18cf2; font-weight: 700;
+        }
+        #gp-sidebar .gp-dte-pills { display: flex; gap: 6px; }
+        #gp-sidebar .gp-pill {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 2px 8px; border-radius: 999px;
+            font-size: 11px; font-weight: 600;
+        }
+        #gp-sidebar .gp-pill-mute { background: rgba(255,255,255,0.06); color: var(--text-secondary, #ccc); }
+        #gp-sidebar .gp-pill-warn { background: rgba(255,196,0,0.15); color: #ffcc55; border: 1px solid rgba(255,196,0,0.4); }
+
+        #gp-sidebar .gp-totals-card { display: flex; gap: 10px; }
+        #gp-sidebar .gp-stat { flex: 1; }
+        #gp-sidebar .gp-stat-label {
+            font-size: 11px; letter-spacing: 0.08em; color: var(--text-muted, #888);
+            font-weight: 700;
+        }
+        #gp-sidebar .gp-stat-value {
+            font-size: 18px; font-weight: 700; margin-top: 2px;
+        }
+        #gp-sidebar .gp-stat-pos { color: #26a269; }
+        #gp-sidebar .gp-stat-neg { color: #c33; }
+
+        #gp-sidebar .gp-regime-head {
+            display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px;
+        }
+        #gp-sidebar .gp-regime-dot {
+            font-size: 22px; line-height: 1;
+            width: 22px; height: 22px; display: inline-flex;
+            align-items: center; justify-content: center;
+            border-radius: 50%;
+            background: rgba(38, 162, 105, 0.15);
+            color: #26a269;
+        }
+        #gp-sidebar .gp-regime-dot.gp-neg { background: rgba(204, 51, 51, 0.15); color: #ff6666; }
+        #gp-sidebar .gp-regime-dot.gp-mix { background: rgba(255, 196, 0, 0.15); color: #ffcc55; }
+        #gp-sidebar .gp-regime-label { font-size: 16px; font-weight: 700; margin-top: 1px; }
+        #gp-sidebar .gp-regime-desc {
+            font-size: 11.5px; color: var(--text-secondary, #b9c1cb);
+            margin-bottom: 10px;
+        }
+
+        #gp-sidebar .gp-levels { display: flex; flex-direction: column; gap: 4px; }
+        #gp-sidebar .gp-level-row {
+            display: grid;
+            grid-template-columns: 16px 1fr auto auto;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            border-radius: 4px;
+            font-size: 12.5px;
+        }
+        #gp-sidebar .gp-level-row:hover { background: rgba(255,255,255,0.03); }
+        #gp-sidebar .gp-level-row.gp-spot {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.07);
+        }
+        #gp-sidebar .gp-level-dot { font-size: 10px; line-height: 1; }
+        #gp-sidebar .gp-dot-call    { color: #26a269; }
+        #gp-sidebar .gp-dot-put     { color: #ff5c5c; }
+        #gp-sidebar .gp-dot-trans   { color: #5dd6ff; }
+        #gp-sidebar .gp-dot-hvl     { color: #5dd6ff; }
+        #gp-sidebar .gp-dot-spot    { color: #888; }
+        #gp-sidebar .gp-level-label { font-weight: 600; }
+        #gp-sidebar .gp-level-spot  { color: var(--text-secondary, #b9c1cb); font-weight: 600; }
+        #gp-sidebar .gp-level-price { color: var(--text-primary, #eef2f7); font-variant-numeric: tabular-nums; }
+        #gp-sidebar .gp-level-pct   { font-size: 11.5px; font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
+        #gp-sidebar .gp-pct-pos { color: #26a269; }
+        #gp-sidebar .gp-pct-neg { color: #ff5c5c; }
+
+        #gp-sidebar .gp-chain-head {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 8px;
+            border-bottom: 1px solid var(--border-color, #333);
+            padding-bottom: 8px;
+        }
+        #gp-sidebar .gp-chain-note { font-size: 10px; color: var(--text-muted, #888); }
+        #gp-sidebar .gp-chain-side {
+            text-align: center; font-weight: 700; font-size: 18px; color: #26a269;
+            margin-top: 4px;
+        }
+        #gp-sidebar .gp-chain-side.gp-side-puts { color: #ff5c5c; }
+        #gp-sidebar .gp-chain-side.gp-side-bal  { color: var(--text-secondary, #ccc); }
+        #gp-sidebar .gp-chain-sub {
+            text-align: center; font-size: 11px;
+            color: var(--text-muted, #888); margin-bottom: 8px;
+        }
+        #gp-sidebar .gp-gauge { padding: 4px 4px 6px; }
+        #gp-sidebar .gp-gauge-track {
+            position: relative;
+            height: 4px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ff5c5c 0%, #b9c1cb 50%, #26a269 100%);
+        }
+        #gp-sidebar .gp-gauge-thumb {
+            position: relative;
+            width: 12px; height: 12px;
+            border-radius: 50%;
+            background: #26a269;
+            box-shadow: 0 0 8px rgba(38,162,105,0.6);
+            margin-top: -8px;
+            transform: translateX(-50%);
+            transition: left 0.2s ease, background 0.2s ease;
+            left: 50%;
+        }
+        #gp-sidebar .gp-gauge-labels {
+            display: flex; justify-content: space-between;
+            font-size: 9.5px; color: var(--text-muted, #888);
+            margin-top: 6px; font-weight: 600; letter-spacing: 0.06em;
+        }
+        #gp-sidebar .gp-ratio-row { display: flex; gap: 8px; margin-top: 10px; }
+        #gp-sidebar .gp-ratio-cell {
+            flex: 1; padding: 6px 8px;
+            border: 1px solid var(--border-color, #333);
+            border-radius: 6px;
+            text-align: center;
+        }
+        #gp-sidebar .gp-ratio-label { font-size: 9.5px; color: var(--text-muted, #888); letter-spacing: 0.08em; font-weight: 700; }
+        #gp-sidebar .gp-ratio-value { font-size: 15px; font-weight: 700; }
+
+        #gp-sidebar .gp-bar-block { margin-top: 10px; }
+        #gp-sidebar .gp-bar-label { font-size: 10px; color: var(--text-muted, #888); letter-spacing: 0.08em; font-weight: 700; margin-bottom: 4px; }
+        #gp-sidebar .gp-bar {
+            height: 6px; background: #ff5c5c;
+            border-radius: 999px; overflow: hidden;
+            position: relative;
+        }
+        #gp-sidebar .gp-bar-fill {
+            height: 100%; background: #26a269;
+            border-radius: 999px 0 0 999px;
+            transition: width 0.2s ease;
+        }
+        #gp-sidebar .gp-bar-foot {
+            display: flex; justify-content: space-between;
+            font-size: 11px; margin-top: 4px;
+            font-variant-numeric: tabular-nums;
+        }
+        #gp-sidebar .gp-bar-foot span:first-child { color: #26a269; }
+        #gp-sidebar .gp-bar-foot span:last-child  { color: #ff5c5c; }
+
+        #gp-sidebar .gp-empty {
+            text-align: center; color: var(--text-muted, #888);
+            font-size: 12px; padding: 20px 12px;
+        }
+
+        @media (max-width: 720px) {
+            #gp-sidebar { width: 100%; }
+        }
+    </style>
+
+    <script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const sidebar = $('gp-sidebar');
+        let pollTimer = null;
+
+        function fmtLarge(n) {
+            if (n == null || isNaN(n)) return '—';
+            const a = Math.abs(n);
+            const sign = n < 0 ? '-' : '';
+            if (a >= 1e9) return sign + (a / 1e9).toFixed(2) + 'B';
+            if (a >= 1e6) return sign + (a / 1e6).toFixed(2) + 'M';
+            if (a >= 1e3) return sign + (a / 1e3).toFixed(2) + 'K';
+            return sign + a.toFixed(2);
+        }
+        function fmtPrice(n) {
+            if (n == null || isNaN(n)) return '—';
+            return Number(n).toFixed(2).replace(/\.00$/, '');
+        }
+        function fmtVol(n) {
+            if (n == null || isNaN(n) || n === 0) return '0';
+            const a = Math.abs(n);
+            if (a >= 1e6) return (a / 1e6).toFixed(1) + 'M';
+            if (a >= 1e3) return (a / 1e3).toFixed(1) + 'K';
+            return String(Math.round(a));
+        }
+        function fmtPct(n, opts) {
+            opts = opts || {};
+            if (n == null || isNaN(n)) return '—';
+            const sign = n >= 0 ? '+' : '';
+            return sign + n.toFixed(2) + '%';
+        }
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function getActiveTicker() {
+            const el = document.getElementById('ticker');
+            return el && el.value ? String(el.value).toUpperCase().trim() : '';
+        }
+        function getSelectedExpiries() {
+            return Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked'))
+                .map(cb => cb.value).filter(Boolean);
+        }
+        function getGexSign() {
+            const el = document.querySelector('input[name="gex_sign"]:checked')
+                    || document.getElementById('gex_sign');
+            return (el && el.value) || 'dealer';
+        }
+        function todayLabel() {
+            const d = new Date();
+            const m = d.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+            return m + ' ' + d.getDate() + ', ' + d.getFullYear();
+        }
+
+        function dotClassFor(type) {
+            switch (type) {
+                case 'call_wall': return 'gp-dot-call';
+                case 'put_wall':  return 'gp-dot-put';
+                case 'c_trans':
+                case 'p_trans':   return 'gp-dot-trans';
+                case 'hvl':       return 'gp-dot-hvl';
+                default:          return 'gp-dot-spot';
+            }
+        }
+
+        function mergeCoincidentLevels(levels) {
+            // Two non-spot levels at the same rounded price → merge labels
+            // ("HVL = pTrans"). Mirrors the screenshot's compact row layout.
+            const out = [];
+            for (const l of levels) {
+                const last = out[out.length - 1];
+                if (last && l.type !== 'spot' && last.type !== 'spot' &&
+                    Math.abs(last.price - l.price) < 0.01) {
+                    last.label = last.label + ' = ' + l.label;
+                    last.type  = last.type === 'hvl' ? 'hvl' : last.type;
+                    continue;
+                }
+                out.push(Object.assign({}, l));
+            }
+            return out;
+        }
+
+        function renderLevelRow(l) {
+            if (l.type === 'spot') {
+                return '<div class="gp-level-row gp-spot">'
+                    +  '<span class="gp-level-dot ' + dotClassFor(l.type) + '">⊗</span>'
+                    +  '<span class="gp-level-spot">' + escapeHtml(l.label) + '</span>'
+                    +  '<span class="gp-level-price">' + fmtPrice(l.price) + '</span>'
+                    +  '<span class="gp-level-pct"></span>'
+                    +  '</div>';
+            }
+            const pctCls = l.pct_from_spot >= 0 ? 'gp-pct-pos' : 'gp-pct-neg';
+            return '<div class="gp-level-row">'
+                +  '<span class="gp-level-dot ' + dotClassFor(l.type) + '">●</span>'
+                +  '<span class="gp-level-label">' + escapeHtml(l.label) + '</span>'
+                +  '<span class="gp-level-price">' + fmtPrice(l.price) + '</span>'
+                +  '<span class="gp-level-pct ' + pctCls + '">' + fmtPct(l.pct_from_spot) + '</span>'
+                +  '</div>';
+        }
+
+        function render(payload) {
+            $('gp-error').style.display = 'none';
+
+            // Date + DTE pills
+            $('gp-date').textContent = todayLabel();
+            const dteEl = $('gp-dte-pill');
+            const zeroEl = $('gp-dte-zero');
+            if (payload.min_dte != null) {
+                dteEl.textContent = payload.min_dte + ' DTE';
+                dteEl.style.display = '';
+                zeroEl.style.display = payload.min_dte === 0 ? '' : 'none';
+            } else {
+                dteEl.style.display = 'none';
+                zeroEl.style.display = 'none';
+            }
+
+            // GEX/DEX totals (color by sign, ignore tiny absolute values)
+            const gex = payload.gex_total;
+            const dex = payload.dex_total;
+            const gexEl = $('gp-gex'); const dexEl = $('gp-dex');
+            gexEl.textContent = fmtLarge(gex);
+            dexEl.textContent = fmtLarge(dex);
+            gexEl.className = 'gp-stat-value ' + (gex >= 0 ? 'gp-stat-pos' : 'gp-stat-neg');
+            dexEl.className = 'gp-stat-value ' + (dex >= 0 ? 'gp-stat-pos' : 'gp-stat-neg');
+
+            // Regime
+            const regime = payload.regime || {};
+            const dot = $('gp-regime-dot');
+            $('gp-regime-label').textContent = regime.label || '—';
+            $('gp-regime-desc').textContent  = regime.description || '';
+            dot.classList.remove('gp-neg', 'gp-mix');
+            if (regime.label === 'Negative Gamma') {
+                dot.classList.add('gp-neg'); dot.textContent = '−';
+            } else if (regime.label === 'Mixed Gamma') {
+                dot.classList.add('gp-mix'); dot.textContent = '~';
+            } else {
+                dot.textContent = '+';
+            }
+
+            // Levels
+            const merged = mergeCoincidentLevels(payload.levels || []);
+            $('gp-levels').innerHTML = merged.map(renderLevelRow).join('');
+
+            // Chain activity
+            const chain = payload.chain || {};
+            const cv = chain.call_volume || 0, pv = chain.put_volume || 0;
+            const co = chain.call_oi || 0,    po = chain.put_oi || 0;
+
+            const totV = cv + pv;
+            const totO = co + po;
+            const callShareV = totV > 0 ? cv / totV : 0.5;
+            const callShareO = totO > 0 ? co / totO : 0.5;
+
+            // Gauge: 0 (puts) → 100 (calls). Use volume share as the headline.
+            const gaugePct = (callShareV * 100).toFixed(1);
+            const thumb = $('gp-gauge-thumb');
+            thumb.style.left = gaugePct + '%';
+            const sideEl = $('gp-chain-side');
+            if (callShareV > 0.55) {
+                sideEl.textContent = 'CALLS'; sideEl.className = 'gp-chain-side';
+                thumb.style.background = '#26a269';
+            } else if (callShareV < 0.45) {
+                sideEl.textContent = 'PUTS'; sideEl.className = 'gp-chain-side gp-side-puts';
+                thumb.style.background = '#ff5c5c';
+            } else {
+                sideEl.textContent = 'BALANCED'; sideEl.className = 'gp-chain-side gp-side-bal';
+                thumb.style.background = '#b9c1cb';
+            }
+
+            $('gp-vol-ratio').textContent = chain.vol_ratio != null ? chain.vol_ratio.toFixed(2) : '—';
+            $('gp-oi-ratio').textContent  = chain.oi_ratio  != null ? chain.oi_ratio.toFixed(2)  : '—';
+
+            $('gp-vol-bar-call').style.width = (callShareV * 100).toFixed(1) + '%';
+            $('gp-oi-bar-call').style.width  = (callShareO * 100).toFixed(1) + '%';
+
+            $('gp-vol-call').textContent = fmtVol(cv) + ' Call';
+            $('gp-vol-put').textContent  = fmtVol(pv) + ' Put';
+            $('gp-oi-call').textContent  = fmtVol(co) + ' Call';
+            $('gp-oi-put').textContent   = fmtVol(po) + ' Put';
+        }
+
+        function showError(msg) {
+            $('gp-error').textContent = msg;
+            $('gp-error').style.display = '';
+        }
+
+        function refreshGammaProfile() {
+            const ticker = getActiveTicker();
+            if (!ticker) { showError('No active ticker'); return; }
+            const expiries = getSelectedExpiries();
+            fetch('/gamma_profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    ticker: ticker,
+                    expiry: expiries,
+                    gex_sign: getGexSign(),
+                }),
+            })
+            .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
+            .then(({ ok, body }) => {
+                if (!ok || body.error) {
+                    showError(body.error || 'Failed to load gamma profile');
+                    return;
+                }
+                render(body);
+            })
+            .catch(err => showError('Network error: ' + err));
+        }
+
+        function startPolling() {
+            stopPolling();
+            refreshGammaProfile();
+            pollTimer = setInterval(refreshGammaProfile, 5000);
+        }
+        function stopPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        function openSidebar()  { sidebar.classList.add('open'); startPolling(); }
+        function closeSidebar() { sidebar.classList.remove('open'); stopPolling(); }
+        function toggleSidebar() {
+            if (sidebar.classList.contains('open')) closeSidebar();
+            else openSidebar();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = $('gammaProfileButton');
+            if (btn) btn.addEventListener('click', toggleSidebar);
+            const closeBtn = $('gp-close');
+            if (closeBtn) closeBtn.addEventListener('click', closeSidebar);
+
+            // Re-fetch when the user changes ticker or expiries while the
+            // sidebar is open so the panel always reflects the active context.
+            const tickerEl = document.getElementById('ticker');
+            if (tickerEl) tickerEl.addEventListener('change', () => {
+                if (sidebar.classList.contains('open')) refreshGammaProfile();
+            });
+            document.addEventListener('change', (e) => {
+                if (e.target && e.target.matches('.expiry-option input[type="checkbox"]')) {
+                    if (sidebar.classList.contains('open')) refreshGammaProfile();
+                }
+            });
+        });
+    })();
+    </script>
+
     <!-- ── Positions UI (manual P&L tracker) ─────────────────────────────────── -->
     <div id="positions-modal" role="dialog" aria-modal="true" aria-labelledby="positions-modal-title">
         <div class="am-card">
@@ -16424,6 +16959,199 @@ def _validate_ticker_string(ticker):
     if len(ticker) > 12:
         return False
     return bool(re.match(r'^[\$/]?[A-Za-z0-9._-]+$', ticker))
+
+
+# ── Gamma Profile API ────────────────────────────────────────────────────────
+def _gex_zero_crossing(strike_value_pairs):
+    """Walk strikes ascending, return the price where the cumulative sum
+    crosses zero (linear interpolation between adjacent strikes), or None.
+    Used for gamma flip / call-trans / put-trans level computation."""
+    cum = 0.0
+    prev_K, prev_cum = None, 0.0
+    for K, v in sorted(strike_value_pairs):
+        cum += v
+        if prev_K is not None and prev_cum * cum < 0:
+            t = -prev_cum / (cum - prev_cum)
+            return prev_K + t * (K - prev_K)
+        prev_K, prev_cum = K, cum
+    return None
+
+
+@app.route('/gamma_profile', methods=['POST'])
+def gamma_profile():
+    """Snapshot for the Gamma Profile sidebar: regime label, key levels
+    (C1/P1/cTrans/pTrans/HVL), totals, and chain vol/OI for the active
+    ticker + selected expiries. Reuses _options_cache when warm."""
+    rejection = _guard_update_request()
+    if rejection is not None:
+        return rejection
+    data = request.get_json() or {}
+    ticker = format_ticker(data.get('ticker'))
+    expiry = data.get('expiry')
+    if not ticker:
+        return jsonify({'error': 'Missing ticker'}), 400
+
+    if isinstance(expiry, list):
+        expiry_dates = [e for e in expiry if e]
+    elif expiry:
+        expiry_dates = [expiry]
+    else:
+        expiry_dates = []
+
+    # Honor the per-request GEX sign convention so 'Positive Gamma' agrees
+    # with the rest of the dashboard.
+    gex_sign = data.get('gex_sign', 'dealer')
+    _set_gex_sign(gex_sign)
+
+    expiry_key = build_expiry_selection_key(expiry_dates) if expiry_dates else ''
+    cached = _options_cache.get((ticker, expiry_key), {}) if expiry_dates else {}
+    calls = cached.get('calls')
+    puts = cached.get('puts')
+    S = cached.get('S')
+
+    # Cache miss path: pull a fresh chain so the sidebar works even before
+    # the user has run /update for this ticker/expiry combination.
+    if (calls is None or puts is None or S is None) and expiry_dates:
+        try:
+            exposure_metric = data.get('exposure_metric', 'Open Interest')
+            delta_adjusted = bool(data.get('delta_adjusted', False))
+            cin_val = data.get('calculate_in_notional', True)
+            calculate_in_notional = cin_val.lower() == 'true' if isinstance(cin_val, str) else bool(cin_val)
+            if len(expiry_dates) == 1:
+                calls, puts = fetch_options_for_date(
+                    ticker, expiry_dates[0],
+                    exposure_metric=exposure_metric,
+                    delta_adjusted=delta_adjusted,
+                    calculate_in_notional=calculate_in_notional,
+                )
+            else:
+                calls, puts = fetch_options_for_multiple_dates(
+                    ticker, expiry_dates,
+                    exposure_metric=exposure_metric,
+                    delta_adjusted=delta_adjusted,
+                    calculate_in_notional=calculate_in_notional,
+                )
+            S = get_current_price(ticker)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    if calls is None or puts is None or S is None or (calls.empty and puts.empty):
+        return jsonify({'error': 'No options data available — load the dashboard for this ticker first'}), 404
+
+    total_call_gex = float(calls['GEX'].sum()) if not calls.empty else 0.0
+    total_put_gex = float(puts['GEX'].sum()) if not puts.empty else 0.0
+    total_call_dex = float(calls['DEX'].sum()) if not calls.empty else 0.0
+    total_put_dex = float(puts['DEX'].sum()) if not puts.empty else 0.0
+    gex_total = gex_net(total_call_gex, total_put_gex)
+    dex_total = total_call_dex + total_put_dex
+
+    levels = [{'label': ticker, 'price': float(S), 'pct_from_spot': 0.0, 'type': 'spot'}]
+
+    # Aggregate by strike up-front so multi-expiry chains don't double-count
+    # the same strike across the level / regime computations.
+    ck_gex = calls.groupby('strike')['GEX'].sum() if not calls.empty else pd.Series(dtype=float)
+    pk_gex = puts.groupby('strike')['GEX'].sum() if not puts.empty else pd.Series(dtype=float)
+    ck_vol = calls.groupby('strike')['volume'].sum() if not calls.empty and 'volume' in calls.columns else pd.Series(dtype=float)
+    pk_vol = puts.groupby('strike')['volume'].sum() if not puts.empty and 'volume' in puts.columns else pd.Series(dtype=float)
+
+    # C1: highest |GEX| call strike at-or-above spot. P1: same below spot.
+    if not ck_gex.empty:
+        ck_above = ck_gex[ck_gex.index >= S]
+        if not ck_above.empty:
+            c1 = float(ck_above.abs().idxmax())
+            levels.append({'label': 'C1', 'price': c1, 'type': 'call_wall',
+                           'pct_from_spot': (c1 - S) / S * 100.0})
+    if not pk_gex.empty:
+        pk_below = pk_gex[pk_gex.index <= S]
+        if not pk_below.empty:
+            p1 = float(pk_below.abs().idxmax())
+            levels.append({'label': 'P1', 'price': p1, 'type': 'put_wall',
+                           'pct_from_spot': (p1 - S) / S * 100.0})
+
+    # cTrans/pTrans = zero crossings of call-only and put-only cumulative GEX
+    # under the active dealer/raw convention. gex_net handles the sign so a
+    # strike's call-only contribution is gex_net(call, 0) and put-only is
+    # gex_net(0, put).
+    c_pairs = [(float(K), gex_net(float(v), 0.0)) for K, v in ck_gex.items()]
+    p_pairs = [(float(K), gex_net(0.0, float(v))) for K, v in pk_gex.items()]
+    c_trans = _gex_zero_crossing(c_pairs)
+    p_trans = _gex_zero_crossing(p_pairs)
+    if c_trans is not None:
+        levels.append({'label': 'cTrans', 'price': c_trans, 'type': 'c_trans',
+                       'pct_from_spot': (c_trans - S) / S * 100.0})
+    if p_trans is not None:
+        levels.append({'label': 'pTrans', 'price': p_trans, 'type': 'p_trans',
+                       'pct_from_spot': (p_trans - S) / S * 100.0})
+
+    # HVL: highest combined call+put volume strike.
+    hvl = None
+    combined_vol = ck_vol.add(pk_vol, fill_value=0) if not (ck_vol.empty and pk_vol.empty) else None
+    if combined_vol is not None and not combined_vol.empty and combined_vol.max() > 0:
+        hvl = float(combined_vol.idxmax())
+    if hvl is not None:
+        levels.append({'label': 'HVL', 'price': hvl, 'type': 'hvl',
+                       'pct_from_spot': (hvl - S) / S * 100.0})
+
+    # Combined dealer-net GEX zero crossing → overall gamma flip → regime.
+    overall_pairs = [(float(K), gex_net(float(ck_gex.get(K, 0.0)), float(pk_gex.get(K, 0.0))))
+                     for K in sorted(set(ck_gex.index) | set(pk_gex.index))]
+    gamma_flip = _gex_zero_crossing(overall_pairs)
+
+    if gamma_flip is None:
+        regime_label = 'Mixed Gamma'
+        regime_desc = 'No clear gamma transition in chain'
+    elif S >= gamma_flip:
+        regime_label = 'Positive Gamma'
+        parts = []
+        if hvl is not None and S > hvl:
+            parts.append('Above HVL')
+        if c_trans is not None and S > c_trans:
+            parts.append('beyond cTrans')
+        regime_desc = (' '.join(parts) + ' — positive gamma') if parts else 'Spot above gamma flip — positive gamma'
+    else:
+        regime_label = 'Negative Gamma'
+        parts = []
+        if hvl is not None and S < hvl:
+            parts.append('Below HVL')
+        if p_trans is not None and S < p_trans:
+            parts.append('beyond pTrans')
+        regime_desc = (' '.join(parts) + ' — negative gamma') if parts else 'Spot below gamma flip — negative gamma'
+
+    call_vol = int(calls['volume'].sum()) if 'volume' in calls.columns else 0
+    put_vol = int(puts['volume'].sum()) if 'volume' in puts.columns else 0
+    call_oi = int(calls['openInterest'].sum()) if 'openInterest' in calls.columns else 0
+    put_oi = int(puts['openInterest'].sum()) if 'openInterest' in puts.columns else 0
+    vol_ratio = (call_vol / put_vol) if put_vol > 0 else None
+    oi_ratio = (call_oi / put_oi) if put_oi > 0 else None
+
+    today = datetime.now(pytz.timezone('US/Eastern')).date()
+    dte_list = []
+    for d in expiry_dates:
+        try:
+            dt = datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
+            dte_list.append((dt - today).days)
+        except (ValueError, TypeError):
+            pass
+
+    levels.sort(key=lambda l: l['price'], reverse=True)
+
+    return jsonify({
+        'as_of': datetime.now().isoformat(timespec='seconds'),
+        'ticker': ticker,
+        'spot': float(S),
+        'expiries': expiry_dates,
+        'dte': dte_list,
+        'min_dte': min(dte_list) if dte_list else None,
+        'gex_total': gex_total,
+        'dex_total': dex_total,
+        'regime': {'label': regime_label, 'description': regime_desc, 'gamma_flip': gamma_flip},
+        'levels': levels,
+        'chain': {
+            'call_volume': call_vol, 'put_volume': put_vol,
+            'call_oi': call_oi, 'put_oi': put_oi,
+            'vol_ratio': vol_ratio, 'oi_ratio': oi_ratio,
+        },
+    })
 
 
 # ── Session Reports API ──────────────────────────────────────────────────────
