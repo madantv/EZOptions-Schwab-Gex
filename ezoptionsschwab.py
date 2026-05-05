@@ -15323,8 +15323,13 @@ def index():
                     || document.getElementById('gex_sign');
             return (el && el.value) || 'dealer';
         }
-        function todayLabel() {
-            const d = new Date();
+        function fmtExpiryLabel(isoDate) {
+            // Parse YYYY-MM-DD as a local date (avoids the UTC-shift bug
+            // that hits new Date('2026-05-15') in negative-UTC zones).
+            if (!isoDate) return '—';
+            const parts = String(isoDate).slice(0, 10).split('-');
+            if (parts.length !== 3) return String(isoDate);
+            const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
             const m = d.toLocaleString('en-US', { month: 'short' }).toUpperCase();
             return m + ' ' + d.getDate() + ', ' + d.getFullYear();
         }
@@ -15378,8 +15383,18 @@ def index():
         function render(payload) {
             $('gp-error').style.display = 'none';
 
-            // Date + DTE pills
-            $('gp-date').textContent = todayLabel();
+            // Date + DTE pills — the date reflects the selected expiry (soonest
+            // when multiple are selected), and DTE is computed by the backend
+            // from today to that expiry.
+            const expiries = (payload.expiries || []).slice().sort();
+            const dateEl = $('gp-date');
+            if (expiries.length === 1) {
+                dateEl.textContent = fmtExpiryLabel(expiries[0]);
+            } else if (expiries.length > 1) {
+                dateEl.textContent = fmtExpiryLabel(expiries[0]) + ' +' + (expiries.length - 1);
+            } else {
+                dateEl.textContent = '—';
+            }
             const dteEl = $('gp-dte-pill');
             const zeroEl = $('gp-dte-zero');
             if (payload.min_dte != null) {
