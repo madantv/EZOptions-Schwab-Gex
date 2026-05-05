@@ -1891,6 +1891,10 @@ def format_ticker(ticker):
         return '$NDX'  # Return $NDX for API calls
     elif ticker in ['VIX', '$VIX']:
         return '$VIX'  # Return $VIX for API calls
+    elif ticker in ['RUT', '$RUT']:
+        return '$RUT'  # Russell 2000 cash index — Schwab uses $-prefix
+    elif ticker in ['DJX', '$DJX']:
+        return '$DJX'  # Dow Jones cash index
     return ticker
 
 def format_display_ticker(ticker):
@@ -1909,6 +1913,13 @@ def format_display_ticker(ticker):
     elif ticker in ['$VIX', 'VIX']:
         # For VIX, return VIX for options symbols and $VIX for underlying
         return ['VIX', '$VIX']
+    elif ticker in ['$RUT', 'RUT']:
+        # Russell 2000: monthly options use root RUT, weeklies use RUTW.
+        # Both start with 'RUT' so the prefix-match in fetch_options_for_date
+        # picks up either when we keep the entry list short.
+        return ['RUT', '$RUT']
+    elif ticker in ['$DJX', 'DJX']:
+        return ['DJX', '$DJX']
     elif ticker == 'MARKET2':
         return ['SPY']
     return [ticker]
