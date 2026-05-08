@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template_string, jsonify, request, Response, stream_with_context
+﻿from flask import Flask, render_template_string, jsonify, request, Response, stream_with_context, make_response
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
@@ -13,7 +13,6 @@ import pytz
 import sqlite3
 from contextlib import closing
 from scipy.stats import norm
-import warnings
 import json
 import threading
 import queue
@@ -128,6 +127,11 @@ def init_db():
             ''')
             try:
                 cursor.execute("ALTER TABLE interval_session_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            # ATM IV history — used for the vol-crush profile chart.
+            try:
+                cursor.execute("ALTER TABLE interval_session_data ADD COLUMN atm_iv REAL")
             except sqlite3.OperationalError:
                 pass
             
@@ -681,13 +685,37 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
                     current_date,
                 ))
 
+            # ATM IV — average of call/put IV at the strike closest to spot.
+            # Surfaced via interval_session_data so the vol-crush chart can show
+            # how IV decayed through the session (typical 0DTE: 30-50% off the open).
+            atm_iv = None
+            try:
+                if not range_calls.empty and 'impliedVolatility' in range_calls.columns:
+                    atm_call_strike = min(range_calls['strike'].tolist(), key=lambda s: abs(s - price))
+                    atm_call_iv = float(range_calls.loc[range_calls['strike'] == atm_call_strike, 'impliedVolatility'].iloc[0])
+                else:
+                    atm_call_iv = None
+                if not range_puts.empty and 'impliedVolatility' in range_puts.columns:
+                    atm_put_strike = min(range_puts['strike'].tolist(), key=lambda s: abs(s - price))
+                    atm_put_iv = float(range_puts.loc[range_puts['strike'] == atm_put_strike, 'impliedVolatility'].iloc[0])
+                else:
+                    atm_put_iv = None
+                if atm_call_iv is not None and atm_put_iv is not None:
+                    atm_iv = (atm_call_iv + atm_put_iv) / 2.0
+                elif atm_call_iv is not None:
+                    atm_iv = atm_call_iv
+                elif atm_put_iv is not None:
+                    atm_iv = atm_put_iv
+            except Exception:
+                atm_iv = None
+
             if expected_move_snapshot:
                 cursor.execute('''
                     INSERT INTO interval_session_data (
                         ticker, timestamp, price, expected_move, expected_move_upper,
-                        expected_move_lower, expiry_key, date
+                        expected_move_lower, atm_iv, expiry_key, date
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     ticker,
                     interval_timestamp,
@@ -695,6 +723,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
                     expected_move_snapshot['move'],
                     expected_move_snapshot['upper'],
                     expected_move_snapshot['lower'],
+                    atm_iv,
                     expiry_key,
                     current_date,
                 ))
@@ -750,14 +779,14 @@ def get_interval_session_data(ticker, date=None, expiry_key=None):
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
                 cursor.execute('''
-                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
+                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower, atm_iv
                     FROM interval_session_data
                     WHERE ticker = ? AND date = ?
                     ORDER BY timestamp
                 ''', (ticker, date))
             else:
                 cursor.execute('''
-                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
+                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower, atm_iv
                     FROM interval_session_data
                     WHERE ticker = ? AND date = ? AND expiry_key = ?
                     ORDER BY timestamp
@@ -1423,7 +1452,8 @@ class AlertEvaluator:
     subscribers, and optionally POSTed to the alert's webhook_url.
     """
 
-    SUPPORTED_TYPES = ('price_cross', 'gex_flip', 'dex_threshold', 'em_breach', 'wall_shift')
+    SUPPORTED_TYPES = ('price_cross', 'gex_flip', 'dex_threshold', 'em_breach', 'wall_shift',
+                       'pin_watch', 'charm_accel', 'atm_gamma_threshold')
 
     def __init__(self):
         self._sub_lock = threading.Lock()
@@ -1542,7 +1572,7 @@ class AlertEvaluator:
         except (TypeError, ValueError):
             return
         try:
-            alerts = self._load_active(ticker, ('price_cross', 'em_breach'))
+            alerts = self._load_active(ticker, ('price_cross', 'em_breach', 'pin_watch'))
         except Exception as e:
             print(f"[AlertEvaluator] load error: {e}")
             return
@@ -1553,12 +1583,15 @@ class AlertEvaluator:
                     self._eval_price_cross(alert, last)
                 elif alert['alert_type'] == 'em_breach':
                     self._eval_em_breach(alert, last)
+                elif alert['alert_type'] == 'pin_watch':
+                    self._eval_pin_watch(alert, last)
             except Exception as e:
                 print(f"[AlertEvaluator] eval error on alert {alert['id']}: {e}")
 
     def on_greek_snapshot(self, ticker, exposure_by_strike, price, em_snapshot=None):
         try:
-            alerts = self._load_active(ticker, ('gex_flip', 'dex_threshold', 'wall_shift'))
+            alerts = self._load_active(ticker, ('gex_flip', 'dex_threshold', 'wall_shift',
+                                                 'charm_accel', 'atm_gamma_threshold'))
         except Exception as e:
             print(f"[AlertEvaluator] load error: {e}")
             return
@@ -1568,12 +1601,15 @@ class AlertEvaluator:
 
         # Pre-compute summaries used by multiple alert types.
         net_delta_total = sum(v.get('delta', 0) for v in exposure_by_strike.values())
+        net_charm_total = sum(v.get('charm', 0) for v in exposure_by_strike.values())
         wall_strike = None
+        atm_strike = None
         if exposure_by_strike:
             wall_strike = max(
                 exposure_by_strike.keys(),
                 key=lambda s: abs(exposure_by_strike[s].get('gamma', 0)),
             )
+            atm_strike = min(exposure_by_strike.keys(), key=lambda s: abs(s - price))
 
         for alert in alerts:
             try:
@@ -1583,6 +1619,10 @@ class AlertEvaluator:
                     self._eval_dex_threshold(alert, net_delta_total, price)
                 elif alert['alert_type'] == 'wall_shift':
                     self._eval_wall_shift(alert, wall_strike, exposure_by_strike, price)
+                elif alert['alert_type'] == 'charm_accel':
+                    self._eval_charm_accel(alert, net_charm_total, price)
+                elif alert['alert_type'] == 'atm_gamma_threshold':
+                    self._eval_atm_gamma_threshold(alert, atm_strike, exposure_by_strike, price)
             except Exception as e:
                 print(f"[AlertEvaluator] eval error on alert {alert['id']}: {e}")
 
@@ -1698,6 +1738,78 @@ class AlertEvaluator:
                 'price': price,
             })
 
+    def _eval_pin_watch(self, alert, last):
+        """Underlying within X% of strike Y, optionally only during a time window."""
+        params = json.loads(alert['params_json'] or '{}')
+        try:
+            strike = float(params.get('strike'))
+            pct = float(params.get('pct', 0.5))  # default 0.5%
+        except (TypeError, ValueError):
+            return
+        # Optional time window: only fire when current ET clock matches HH:MM ± 1min.
+        target_h = params.get('hour_et')
+        target_m = params.get('minute_et')
+        if target_h is not None and target_m is not None:
+            try:
+                est = pytz.timezone('US/Eastern')
+                now_et = datetime.now(est)
+                if now_et.hour != int(target_h):
+                    return
+                if abs(now_et.minute - int(target_m)) > 1:
+                    return
+            except Exception:
+                pass
+        within = abs(last - strike) <= strike * pct / 100.0
+        prev = alert.get('last_value') or 0
+        self._update_alert_state(alert['id'], last_value=1.0 if within else 0.0)
+        # Fire on rising edge (entered the band).
+        if within and prev < 0.5:
+            self._fire(alert, {
+                'price': last, 'strike': strike, 'pct': pct,
+                'distance': last - strike,
+            })
+
+    def _eval_charm_accel(self, alert, net_charm_total, price):
+        """Total dealer Δ unwind rate (per minute) crossed an absolute threshold."""
+        params = json.loads(alert['params_json'] or '{}')
+        try:
+            threshold = float(params.get('abs_value', 0))
+        except (TypeError, ValueError):
+            return
+        # net_charm_total is per-day (charm field already scaled in calculate_greek_exposures).
+        # Per-minute = / 390 trading minutes. Use absolute since direction varies.
+        accel = abs(net_charm_total) / 390.0
+        prev = alert.get('last_value')
+        self._update_alert_state(alert['id'], last_value=accel)
+        if prev is None:
+            return
+        # Rising-edge fire — only when crossing the threshold.
+        if prev < threshold <= accel:
+            self._fire(alert, {
+                'accel_per_min': accel, 'threshold': threshold,
+                'net_charm_total': net_charm_total, 'price': price,
+            })
+
+    def _eval_atm_gamma_threshold(self, alert, atm_strike, exposure_by_strike, price):
+        """Net gamma at the ATM strike crossed an absolute threshold."""
+        if atm_strike is None:
+            return
+        params = json.loads(alert['params_json'] or '{}')
+        try:
+            threshold = float(params.get('abs_value', 0))
+        except (TypeError, ValueError):
+            return
+        atm_gamma = abs(exposure_by_strike.get(atm_strike, {}).get('gamma', 0))
+        prev = alert.get('last_value')
+        self._update_alert_state(alert['id'], last_value=atm_gamma)
+        if prev is None:
+            return
+        if prev < threshold <= atm_gamma:
+            self._fire(alert, {
+                'atm_strike': atm_strike, 'atm_gamma': atm_gamma,
+                'threshold': threshold, 'price': price,
+            })
+
     @staticmethod
     def _rearm_ok(alert, prev_value, ref, current):
         # In one-shot mode the firing path flips status to 'triggered', so the alert
@@ -1801,6 +1913,38 @@ def _compute_session_report(ticker, date_str):
     except Exception:
         pass
 
+    # ── Pin closeout: top-3 pin candidates from the last bar of the session,
+    # plus how close the actual close came to each. Lets you backtest the
+    # magnet hypothesis day-by-day.
+    pin_top = []
+    pin_winner = None
+    pin_winner_distance = None
+    try:
+        last_bar_ts = max(r[0] for r in rows)
+        last_bar = [r for r in rows if r[0] == last_bar_ts]
+        ref_price = last_bar[0][1] if last_bar else last_price
+        scores = []
+        for r in last_bar:
+            strike = r[2]
+            ng = r[3] or 0
+            abs_g = abs(ng)
+            if abs_g <= 0:
+                continue
+            proximity = 1.0 / (1.0 + abs(ref_price - strike) / max(ref_price, 1.0))
+            scores.append((strike, abs_g * proximity))
+        scores.sort(key=lambda kv: kv[1], reverse=True)
+        pin_top = [{'strike': float(s),
+                    'distance_to_close': round(last_price - s, 2),
+                    'score': float(sc)}
+                   for s, sc in scores[:3]]
+        if pin_top:
+            # "Winner" = the candidate strike actually closest to the close price.
+            best = min(pin_top, key=lambda p: abs(p['distance_to_close']))
+            pin_winner = best['strike']
+            pin_winner_distance = best['distance_to_close']
+    except Exception:
+        pass
+
     return {
         'date': date_str,
         'ticker': ticker,
@@ -1823,6 +1967,9 @@ def _compute_session_report(ticker, date_str):
         'centroid_min': centroid_min,
         'centroid_max': centroid_max,
         'minute_bars': len(timestamps),
+        'pin_candidates': pin_top,
+        'pin_winner_strike': pin_winner,
+        'pin_winner_distance': pin_winner_distance,
     }
 
 
@@ -2496,7 +2643,7 @@ def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
         vanna = -np.exp(-q * t) * norm.pdf(d1) * d2 / sigma
         
         return delta, gamma, vega, vanna
-    except Exception as e:
+    except Exception:
         return 0, 0, 0, 0
 
 def calculate_theta(flag, S, K, t, sigma, r=0.02, q=0):
@@ -3287,11 +3434,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         total_net_exposure = total_call_exposure + total_put_exposure
     else:
         total_net_exposure = total_call_exposure + total_put_exposure
-        # Calculate total net volume from the entire chain (not just strike range)
-        total_call_volume = calls['volume'].sum() if not calls.empty and 'volume' in calls.columns else 0
-        total_put_volume = puts['volume'].sum() if not puts.empty and 'volume' in puts.columns else 0
-        total_net_volume = total_call_volume - total_put_volume
-    
+
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
     hover_metric_label = title.replace(' by Strike', '') if title.endswith(' by Strike') else title
@@ -3462,10 +3605,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             ))
     
     add_current_price_reference(fig, S, horizontal=horizontal, text_color=text_color)
-    
-    # Calculate padding as percentage of price range
-    padding = (max_strike - min_strike) * 0.02
-    
+
     chart_title = build_bar_chart_title(
         title,
         total_call_exposure,
@@ -4174,13 +4314,9 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             if candle_time.date() == most_recent_day:
                 current_day_candles.append(candle)
     
-    # Use all candles for calculations but current day candles for display
     if use_heikin_ashi:
-        ha_candles = convert_to_heikin_ashi(all_candles)  # Use all candles for calculations
-        display_candles = convert_to_heikin_ashi(current_day_candles)  # Use current day for display
+        display_candles = convert_to_heikin_ashi(current_day_candles)
     else:
-        # Use regular candles
-        ha_candles = all_candles
         display_candles = current_day_candles
     
     # Get previous day's close
@@ -4209,9 +4345,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         
     price_min = min(lows)
     price_max = max(highs)
-    price_range = price_max - price_min
-    padding = price_range * 0.02  # 2% padding
-    
+
     # Get current price for strike range calculation
     current_price = closes[-1] if closes else (price_min + price_max) / 2
     
@@ -4385,7 +4519,6 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                 if not strikes_sorted:
                     continue
                 atm_strike = min(strikes_sorted, key=lambda x: abs(x - current_price))
-                atm_idx = strikes_sorted.index(atm_strike)
                 # Helper to get mid price
                 def get_mid(df, strike):
                     row = df.loc[df['strike'] == strike]
@@ -4689,7 +4822,7 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
 
     expected_move_by_time = {}
     for row in session_rows:
-        timestamp, price, expected_move, expected_move_upper, expected_move_lower = row
+        timestamp, price, expected_move, expected_move_upper, expected_move_lower = row[:5]
         if expected_move is None or expected_move <= 0 or expected_move_upper is None or expected_move_lower is None:
             continue
         snapped_time = snap_timestamp_to_chart_time(timestamp, chart_times)
@@ -6306,6 +6439,231 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
     return combined_calls, combined_puts
 
 
+def create_gex_profile_chart(calls, puts, S, strike_range=0.05,
+                              call_color='#00FF00', put_color='#FF0000'):
+    """Cumulative dealer GEX walked across strikes (low → high). The chart's
+    Y-axis is cumulative dealer gamma exposure; X-axis is the strike. The
+    zero-crossing is the gamma flip line. Shape tells you how stable the regime
+    is — a steep curve crosses zero firmly, a flat one is fragile."""
+    fig = go.Figure()
+    if calls is None or puts is None:
+        fig.add_annotation(text="No chain data",
+                           showarrow=False, font=dict(color='#888', size=12),
+                           xref='paper', yref='paper', x=0.5, y=0.5)
+    else:
+        try:
+            min_s = S * (1 - strike_range)
+            max_s = S * (1 + strike_range)
+            rc = calls[(calls['strike'] >= min_s) & (calls['strike'] <= max_s)]
+            rp = puts[(puts['strike']  >= min_s) & (puts['strike']  <= max_s)]
+            strikes = sorted(set(rc['strike'].tolist()) | set(rp['strike'].tolist()))
+            if not strikes or 'GEX' not in rc.columns:
+                fig.add_annotation(text="No GEX data in range",
+                                   showarrow=False, font=dict(color='#888', size=12),
+                                   xref='paper', yref='paper', x=0.5, y=0.5)
+            else:
+                cum = 0.0
+                xs, ys, flip_x = [], [], None
+                prev_K, prev_cum = None, 0.0
+                for K in strikes:
+                    c_v = float(rc.loc[rc['strike'] == K, 'GEX'].sum())
+                    p_v = float(rp.loc[rp['strike'] == K, 'GEX'].sum())
+                    cum += gex_net(c_v, p_v)
+                    if prev_K is not None and flip_x is None and prev_cum * cum < 0:
+                        t = -prev_cum / (cum - prev_cum)
+                        flip_x = prev_K + t * (K - prev_K)
+                    xs.append(K); ys.append(cum)
+                    prev_K, prev_cum = K, cum
+
+                # Two traces: positive shaded region in call colour, negative in put colour.
+                # Plotly fills toward zero-line for an intuitive "above/below" read.
+                pos_y = [y if y > 0 else 0 for y in ys]
+                neg_y = [y if y < 0 else 0 for y in ys]
+                fig.add_trace(go.Scatter(
+                    x=xs, y=pos_y, mode='lines',
+                    line=dict(color=call_color, width=0),
+                    fill='tozeroy', fillcolor=hex_to_rgba(call_color, 0.4) if 'hex_to_rgba' in globals() else 'rgba(38,162,105,0.4)',
+                    hoverinfo='skip', showlegend=False,
+                ))
+                fig.add_trace(go.Scatter(
+                    x=xs, y=neg_y, mode='lines',
+                    line=dict(color=put_color, width=0),
+                    fill='tozeroy', fillcolor=hex_to_rgba(put_color, 0.4) if 'hex_to_rgba' in globals() else 'rgba(204,51,51,0.4)',
+                    hoverinfo='skip', showlegend=False,
+                ))
+                fig.add_trace(go.Scatter(
+                    x=xs, y=ys, mode='lines',
+                    line=dict(color='#eef2f7', width=2),
+                    hovertemplate='Strike: $%{x:.2f}<br>Cum GEX: %{y:,.0f}<extra></extra>',
+                    name='Cum GEX',
+                ))
+                # Spot price reference + zero line
+                fig.add_vline(x=S, line_dash='dot', line_color='#888', line_width=1, opacity=0.7,
+                              annotation_text=f'spot ${S:.2f}', annotation_position='top')
+                if flip_x is not None:
+                    fig.add_vline(x=flip_x, line_dash='solid', line_color='#ffaa33',
+                                  line_width=2, opacity=0.85,
+                                  annotation_text=f'γ Flip ${flip_x:.2f}', annotation_position='top')
+                fig.add_hline(y=0, line_dash='dot', line_color='#666', line_width=1, opacity=0.6)
+        except Exception as e:
+            fig.add_annotation(text=f"Error: {e}",
+                               showarrow=False, font=dict(color='#888', size=12),
+                               xref='paper', yref='paper', x=0.5, y=0.5)
+
+    fig.update_layout(
+        title=build_left_aligned_title('GEX Profile — cumulative dealer gamma vs strike', y=0.98),
+        xaxis=dict(title='Strike', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True),
+        yaxis=dict(title='Cumulative dealer GEX', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True, zeroline=True, zerolinecolor='#666'),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=70, r=50, t=50, b=50),
+        showlegend=False,
+        autosize=True,
+    )
+    return fig.to_json()
+
+
+def create_vol_crush_chart(ticker, expiry_dates=None):
+    """Plot ATM IV through the session — visualises morning-to-close vol crush.
+
+    For 0DTE, IV typically crushes 30-50% off the open as time-decay accelerates.
+    Reads atm_iv from interval_session_data (populated minute-by-minute by
+    store_interval_data)."""
+    expiry_key = build_expiry_selection_key(expiry_dates) if expiry_dates else ''
+    rows = get_interval_session_data(ticker, expiry_key=expiry_key) or []
+    if not rows:
+        last_date = get_last_session_date(ticker, 'interval_session_data', expiry_key=expiry_key)
+        if last_date:
+            rows = get_interval_session_data(ticker, last_date, expiry_key=expiry_key) or []
+
+    fig = go.Figure()
+    series = [(r[0], r[5]) for r in rows if len(r) >= 6 and r[5] is not None]
+    if not series:
+        fig.add_annotation(text="No ATM IV history yet (writes during market hours)",
+                           showarrow=False, font=dict(color='#888', size=12),
+                           xref='paper', yref='paper', x=0.5, y=0.5)
+    else:
+        est = pytz.timezone('US/Eastern')
+        times = [datetime.fromtimestamp(t, est) for t, _ in series]
+        ivs   = [iv * 100 for _, iv in series]  # to %
+        open_iv = ivs[0] if ivs else 0.0
+        cur_iv  = ivs[-1] if ivs else 0.0
+        crush_pct = round(100.0 * (open_iv - cur_iv) / open_iv, 1) if open_iv > 0 else 0.0
+
+        fig.add_trace(go.Scatter(
+            x=times, y=ivs,
+            mode='lines',
+            line=dict(color='#7fafff', width=2),
+            fill='tozeroy', fillcolor='rgba(127, 175, 255, 0.12)',
+            hovertemplate='%{x|%H:%M}<br>ATM IV: %{y:.2f}%<extra></extra>',
+            name='ATM IV',
+        ))
+        # Reference line at the morning's IV so the crush is visually obvious.
+        fig.add_hline(y=open_iv, line_dash='dot', line_color='#888', line_width=1,
+                      opacity=0.6, annotation_text=f'open {open_iv:.1f}%',
+                      annotation_position='right')
+
+        # Title shows the live crush percentage so you don't need to eyeball it.
+        crush_label = f'crushed {crush_pct:.1f}%' if crush_pct > 0 else f'expanded {-crush_pct:.1f}%'
+        fig.update_layout(title=build_left_aligned_title(
+            f'Vol Crush — ATM IV ({crush_label})', y=0.98))
+
+    fig.update_layout(
+        xaxis=dict(title='Time (ET)', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True, tickformat='%H:%M'),
+        yaxis=dict(title='ATM IV (%)', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=70, r=50, t=50, b=50),
+        showlegend=False,
+        autosize=True,
+    )
+    if not series:
+        fig.update_layout(title=build_left_aligned_title('Vol Crush — ATM IV', y=0.98))
+    return fig.to_json()
+
+
+def create_atm_gamma_series_chart(ticker, expiry_dates=None, call_color='#00FF00', put_color='#FF0000'):
+    """Plot ATM-strike net gamma over the session (a 0DTE "gamma vortex" view).
+
+    For each minute bar in interval_data, we pick the strike closest to that
+    bar's price and read its net_gamma. As 0DTE approaches expiry, ATM gamma
+    spikes exponentially — the curve makes that visible.
+    """
+    expiry_key = build_expiry_selection_key(expiry_dates) if expiry_dates else ''
+    rows = get_interval_data(ticker, expiry_key=expiry_key) or []
+    if not rows:
+        last_date = get_last_session_date(ticker, 'interval_data', expiry_key=expiry_key)
+        if last_date:
+            rows = get_interval_data(ticker, last_date, expiry_key=expiry_key) or []
+
+    fig = go.Figure()
+    if not rows:
+        fig.add_annotation(text="No interval data yet (ATM γ needs ≥1 minute bar)",
+                           showarrow=False, font=dict(color='#888', size=12),
+                           xref='paper', yref='paper', x=0.5, y=0.5)
+    else:
+        # Group rows by timestamp; pick the strike closest to that bar's price
+        # and use its net_gamma. interval_data row layout:
+        # (timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+        #  abs_gex_total, net_volume, net_speed, net_vomma, net_color)
+        from collections import defaultdict
+        by_ts = defaultdict(list)
+        for r in rows:
+            by_ts[r[0]].append((r[1], r[2], r[3] or 0))
+
+        est = pytz.timezone('US/Eastern')
+        times, gammas = [], []
+        for ts in sorted(by_ts.keys()):
+            entries = by_ts[ts]
+            if not entries:
+                continue
+            spot = entries[0][0]
+            # Strike closest to spot wins as ATM.
+            atm_entry = min(entries, key=lambda e: abs(e[1] - spot))
+            times.append(datetime.fromtimestamp(ts, est))
+            gammas.append(atm_entry[2])
+
+        if not times:
+            fig.add_annotation(text="No ATM data points",
+                               showarrow=False, font=dict(color='#888', size=12),
+                               xref='paper', yref='paper', x=0.5, y=0.5)
+        else:
+            colors = [call_color if g >= 0 else put_color for g in gammas]
+            fig.add_trace(go.Scatter(
+                x=times, y=gammas,
+                mode='lines+markers',
+                line=dict(color='#ffaa33', width=2),
+                marker=dict(color=colors, size=6, line=dict(color='#1E1E1E', width=0.5)),
+                hovertemplate='%{x|%H:%M}<br>ATM γ: %{y:,.0f}<extra></extra>',
+                name='ATM γ',
+            ))
+            fig.add_hline(y=0, line_dash='dot', line_color='#666', line_width=1, opacity=0.6)
+
+    fig.update_layout(
+        title=build_left_aligned_title('ATM Gamma — vortex toward close', y=0.98),
+        xaxis=dict(title='Time (ET)', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True, tickformat='%H:%M'),
+        yaxis=dict(title='Net γ at ATM strike', title_font=dict(color='#CCCCCC'),
+                   tickfont=dict(color='#CCCCCC'), gridcolor='#333', linecolor='#333',
+                   showline=True, mirror=True, zeroline=True, zerolinecolor='#666'),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        margin=dict(l=70, r=50, t=50, b=50),
+        showlegend=False,
+        autosize=True,
+    )
+    return fig.to_json()
+
+
 def create_delta_decay_chart(calls, puts, S, strike_range=0.02,
                               call_color='#00FF00', put_color='#FF0000',
                               selected_expiries=None, horizontal=False):
@@ -6506,7 +6864,10 @@ def create_flow_pulse_chart(ticker, expiry_dates=None, lookback_minutes=15,
 
 @app.route('/')
 def index():
-    return render_template_string('''
+    # Force browsers to re-fetch the HTML on every refresh. Without this,
+    # a stale cached page can land on browser refresh and the JS chain that
+    # creates the chart never re-runs cleanly, leaving the chart blank.
+    resp = make_response(render_template_string('''
 <!DOCTYPE html>
 <html>
 <head>
@@ -8387,7 +8748,7 @@ def index():
         }
         function fmtStrike(n) {
             if (n == null || isNaN(n)) return '—';
-            return Number(n).toFixed(Number.isInteger(+n) ? 0 : 2).replace(/\.00$/, '');
+            return Number(n).toFixed(Number.isInteger(+n) ? 0 : 2).replace(/\\.00$/, '');
         }
         function fmtStamp(iso) {
             if (!iso) return '—';
@@ -8806,6 +9167,18 @@ def index():
             <div class="chart-checkbox">
                 <input type="checkbox" id="delta_decay">
                 <label for="delta_decay">Δ Decay (0DTE)</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="atm_gamma">
+                <label for="atm_gamma">ATM γ Series (0DTE)</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="vol_crush">
+                <label for="vol_crush">Vol Crush (ATM IV)</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="gex_profile">
+                <label for="gex_profile">GEX Profile</label>
             </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="centroid" checked>
@@ -10486,7 +10859,7 @@ def index():
         return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
     function stripTooltipHtml(value) {
-        return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\\\\s+/g, ' ').trim();
+        return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();
     }
     function formatTooltipNumber(value, maxFractionDigits) {
         const numericValue = Number(value);
@@ -10501,7 +10874,7 @@ def index():
     }
     function formatTooltipDateTime(value) {
         if (value == null || value === '') return '';
-        if (typeof value === 'string' && /^\\\\d{2}:\\\\d{2}(:\\\\d{2})?(\\\\s*[A-Z]{2,4})?$/.test(value.trim())) return value;
+        if (typeof value === 'string' && /^\\d{2}:\\d{2}(:\\d{2})?(\\s*[A-Z]{2,4})?$/.test(value.trim())) return value;
         const parsedDate = value instanceof Date ? value : new Date(value);
         if (!Number.isFinite(parsedDate.getTime())) return String(value);
         const sameDay = parsedDate.toDateString() === new Date().toDateString();
@@ -10515,7 +10888,7 @@ def index():
             if (hex.length === 3) return { r: parseInt(hex[0] + hex[0], 16), g: parseInt(hex[1] + hex[1], 16), b: parseInt(hex[2] + hex[2], 16) };
             if (hex.length === 6) return { r: parseInt(hex.slice(0, 2), 16), g: parseInt(hex.slice(2, 4), 16), b: parseInt(hex.slice(4, 6), 16) };
         }
-        const rgbMatch = color.match(/rgba?\\\\(([^)]+)\\\\)/i);
+        const rgbMatch = color.match(/rgba?\\(([^)]+)\\)/i);
         if (!rgbMatch) return null;
         const parts = rgbMatch[1].split(',').map(part => Number.parseFloat(part.trim()));
         if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return null;
@@ -10594,7 +10967,7 @@ def index():
         const isHeatmapPoint = point && point.fullData && point.fullData.type === 'heatmap';
         const isCentroidPoint = /centroid/i.test(traceName);
         const chartTitle = stripTooltipHtml(plotDiv && plotDiv._fullLayout && plotDiv._fullLayout.title ? plotDiv._fullLayout.title.text : '');
-        let name = traceName && !/^trace\\\\s+\\\\d+$/i.test(traceName) ? traceName : 'Value';
+        let name = traceName && !/^trace\\s+\\d+$/i.test(traceName) ? traceName : 'Value';
         let value = '';
         if (isPiePoint) {
             name = point.label || name;
@@ -10923,7 +11296,7 @@ def index():
         }
 
         function stripTooltipHtml(value) {
-            return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+            return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();
         }
 
         function formatTooltipNumber(value, maxFractionDigits = 2) {
@@ -10947,7 +11320,7 @@ def index():
 
         function formatTooltipDateTime(value) {
             if (value == null || value === '') return '';
-            if (typeof value === 'string' && /^\d{2}:\d{2}(:\d{2})?(\s*[A-Z]{2,4})?$/.test(value.trim())) {
+            if (typeof value === 'string' && /^\\d{2}:\\d{2}(:\\d{2})?(\\s*[A-Z]{2,4})?$/.test(value.trim())) {
                 return value;
             }
             const parsedDate = value instanceof Date ? value : new Date(value);
@@ -10984,7 +11357,7 @@ def index():
                     };
                 }
             }
-            const rgbMatch = color.match(/rgba?\(([^)]+)\)/i);
+            const rgbMatch = color.match(/rgba?\\(([^)]+)\\)/i);
             if (!rgbMatch) return null;
             const parts = rgbMatch[1].split(',').map(part => Number.parseFloat(part.trim()));
             if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return null;
@@ -11091,7 +11464,7 @@ def index():
             const isHeatmapPoint = point?.fullData?.type === 'heatmap';
             const isCentroidPoint = /centroid/i.test(traceName);
             const chartTitle = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || '');
-            let name = traceName && !/^trace\s+\d+$/i.test(traceName) ? traceName : 'Value';
+            let name = traceName && !/^trace\\s+\\d+$/i.test(traceName) ? traceName : 'Value';
             let value = '';
 
             if (isPiePoint) {
@@ -11556,7 +11929,10 @@ def index():
                 show_premium: document.getElementById('premium').checked,
                 show_centroid: document.getElementById('centroid').checked,
                 show_flow_pulse: document.getElementById('flow_pulse').checked,
-                show_delta_decay: document.getElementById('delta_decay').checked
+                show_delta_decay: document.getElementById('delta_decay').checked,
+                show_atm_gamma: document.getElementById('atm_gamma').checked,
+                show_vol_crush: document.getElementById('vol_crush').checked,
+                show_gex_profile: document.getElementById('gex_profile').checked
             };
 
             // Common payload fields shared by both requests
@@ -13583,7 +13959,10 @@ def index():
                 premium: document.getElementById('premium').checked,
                 centroid: document.getElementById('centroid').checked,
                 flow_pulse: document.getElementById('flow_pulse').checked,
-                delta_decay: document.getElementById('delta_decay').checked
+                delta_decay: document.getElementById('delta_decay').checked,
+                atm_gamma: document.getElementById('atm_gamma').checked,
+                vol_crush: document.getElementById('vol_crush').checked,
+                gex_profile: document.getElementById('gex_profile').checked
             };
 
             function resizeRegularCharts() {
@@ -13821,6 +14200,40 @@ def index():
             // Sign drives color (call/put). Always rendered last in the row.
             let gexRegimeHtml = '';
             const regime = info.gex_regime;
+            // Theta-bleed cell: total $ premium decay across the visible chain.
+            let thetaBleedHtml = '';
+            const tb = info.theta_bleed;
+            if (tb && typeof tb.per_minute === 'number' && tb.per_minute > 0) {
+                const tbAbs = Math.abs(tb.per_minute);
+                let tbStr;
+                if (tbAbs >= 1e6) tbStr = '$' + (tbAbs / 1e6).toFixed(2) + 'M';
+                else if (tbAbs >= 1e3) tbStr = '$' + (tbAbs / 1e3).toFixed(1) + 'k';
+                else tbStr = '$' + tbAbs.toFixed(0);
+                thetaBleedHtml = `<div class="price-info-item" title="Total premium decaying from the visible chain. Sum of |theta| × OI × 100 over all options, divided by 390 trading minutes per session.">`
+                    + `<strong>Theta Bleed</strong>`
+                    + `<span style="color:#ffaa33">−${tbStr}/min</span>`
+                    + `</div>`;
+            }
+
+            // Implied vs realized move cell: how much of the morning's expected
+            // move has the underlying actually traded? Tells you if AM IV was
+            // over- or underpriced.
+            let impliedVsRealizedHtml = '';
+            const ivr = info.implied_vs_realized;
+            if (ivr && typeof ivr.open_em === 'number') {
+                const realStr = (ivr.realized >= 0 ? '+' : '') + '$' + Math.abs(ivr.realized).toFixed(2);
+                const realColor = ivr.realized >= 0 ? callColor : putColor;
+                const pct = ivr.consumed_pct;
+                const breachClass = ivr.breached ? ' breach' : '';
+                const breachStyle = ivr.breached ? 'font-weight:700;color:#ffaa33' : 'color:var(--text-secondary, #ccc)';
+                impliedVsRealizedHtml = `<div class="price-info-item${breachClass}" title="Morning expected move (ATM straddle) vs price moved so far. Open: $${ivr.open_price.toFixed(2)} · EM: ±$${ivr.open_em.toFixed(2)}. Breached if realized > EM.">`
+                    + `<strong>EM vs Real</strong>`
+                    + `<span>±$${ivr.open_em.toFixed(2)} · `
+                    + `<span style="color:${realColor}">${realStr}</span> `
+                    + `<span style="${breachStyle}">(${pct}%)</span></span>`
+                    + `</div>`;
+            }
+
             if (regime && typeof regime.net === 'number') {
                 const positive = regime.sign >= 0;
                 const regimeColor = positive ? callColor : putColor;
@@ -13869,6 +14282,8 @@ def index():
                     <strong>Hedge Flow</strong>
                     <span data-hedge-flow style="color:var(--text-muted, #888)">$—/s</span>
                 </div>
+                ${thetaBleedHtml}
+                ${impliedVsRealizedHtml}
             `;
         }
         
@@ -14210,7 +14625,10 @@ def index():
                     premium: document.getElementById('premium').checked,
                     centroid: document.getElementById('centroid').checked,
                     flow_pulse: document.getElementById('flow_pulse').checked,
-                    delta_decay: document.getElementById('delta_decay').checked
+                    delta_decay: document.getElementById('delta_decay').checked,
+                    atm_gamma: document.getElementById('atm_gamma').checked,
+                    vol_crush: document.getElementById('vol_crush').checked,
+                    gex_profile: document.getElementById('gex_profile').checked
                 }
             };
         }
@@ -14693,6 +15111,9 @@ def index():
                                 <option value="dex_threshold">|Net DEX| crosses threshold</option>
                                 <option value="em_breach">Expected-move band breach</option>
                                 <option value="wall_shift">Gamma wall shifts</option>
+                                <option value="pin_watch">Pin watch (price near strike)</option>
+                                <option value="charm_accel">Charm acceleration (Δ unwind/min)</option>
+                                <option value="atm_gamma_threshold">ATM γ threshold</option>
                             </select>
                         </div>
                     </div>
@@ -14755,6 +15176,18 @@ def index():
             em_breach: [],
             wall_shift: [
                 { key: 'min_strikes_moved', label: 'Min wall move ($)', type: 'number', step: '0.5', value: 1 },
+            ],
+            pin_watch: [
+                { key: 'strike', label: 'Strike to watch', type: 'number', step: '0.5', required: true },
+                { key: 'pct', label: 'Within % of strike', type: 'number', step: '0.1', value: 0.5 },
+                { key: 'hour_et',   label: 'Only at hour (ET, optional)',  type: 'number', step: '1' },
+                { key: 'minute_et', label: 'Only at minute (ET, optional)', type: 'number', step: '1' },
+            ],
+            charm_accel: [
+                { key: 'abs_value', label: 'Min |Δ unwind| per minute ($)', type: 'number', step: 'any', required: true },
+            ],
+            atm_gamma_threshold: [
+                { key: 'abs_value', label: 'ATM γ threshold (abs)', type: 'number', step: 'any', required: true },
             ],
         };
 
@@ -14828,6 +15261,16 @@ def index():
                     return `${a.ticker} expected-move breach`;
                 case 'wall_shift':
                     return `${a.ticker} gamma wall shift ≥ $${p.min_strikes_moved || 1}`;
+                case 'pin_watch': {
+                    const t = (p.hour_et != null && p.minute_et != null)
+                        ? ` at ${String(p.hour_et).padStart(2,'0')}:${String(p.minute_et).padStart(2,'0')} ET`
+                        : '';
+                    return `${a.ticker} within ${p.pct || 0.5}% of $${p.strike}${t}`;
+                }
+                case 'charm_accel':
+                    return `${a.ticker} |Δ unwind| > $${p.abs_value}/min`;
+                case 'atm_gamma_threshold':
+                    return `${a.ticker} ATM γ > ${p.abs_value}`;
                 default:
                     return `${a.ticker} ${a.alert_type}`;
             }
@@ -15595,7 +16038,7 @@ def index():
         }
         function fmtPrice(n) {
             if (n == null || isNaN(n)) return '—';
-            return Number(n).toFixed(2).replace(/\.00$/, '');
+            return Number(n).toFixed(2).replace(/\\.00$/, '');
         }
         function fmtVol(n) {
             if (n == null || isNaN(n) || n === 0) return '0';
@@ -16076,7 +16519,11 @@ def index():
     </script>
 </body>
 </html>
-    ''')
+    '''))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/favicon.svg')
 @app.route('/favicon.ico')
@@ -16088,9 +16535,16 @@ def get_expirations(ticker):
     try:
         ticker = format_ticker(ticker)
         expirations = get_option_expirations(ticker)
-        return jsonify(expirations)
+        resp = jsonify(expirations)
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        resp = jsonify({'error': str(e)})
+        resp.status_code = 400
+    # GETs are cacheable by default; without no-store the browser may serve a
+    # stale response on refresh, in which case the loadExpirations chain that
+    # ultimately triggers updateData → /update_price → applyPriceData breaks
+    # and the price chart never renders.
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return resp
 
 @app.route('/update', methods=['POST'])
 def update():
@@ -16182,9 +16636,6 @@ def update():
         if current_time.hour == 23 and current_time.minute == 59:
             clear_old_data()
         
-        # Get timeframe from request
-        timeframe = int(data.get('timeframe', 1))
-
         # NOTE: price chart is handled separately by /update_price
 
         # Calculate volumes and other metrics
@@ -16225,11 +16676,8 @@ def update():
             coloring_mode = 'Linear Intensity' if old_color_intensity else 'Solid'
         call_color = data.get('call_color', '#00ff00')
         put_color = data.get('put_color', '#ff0000')
-        exposure_levels_types = data.get('levels_types', [])
         heatmap_type = normalize_level_type(data.get('heatmap_type', 'GEX'))
         heatmap_coloring_mode = data.get('heatmap_coloring_mode', 'Global')
-        exposure_levels_count = int(data.get('levels_count', 3))
-        use_heikin_ashi = data.get('use_heikin_ashi', False)
         horizontal = data.get('horizontal_bars', False)
         show_abs_gex = data.get('show_abs_gex', False)
         abs_gex_opacity = float(data.get('abs_gex_opacity', 0.2))
@@ -16312,6 +16760,23 @@ def update():
                 selected_expiries=expiry_dates,
             )
 
+        if data.get('show_atm_gamma', False):
+            response['atm_gamma'] = create_atm_gamma_series_chart(
+                ticker, expiry_dates=expiry_dates,
+                call_color=call_color, put_color=put_color,
+            )
+
+        if data.get('show_vol_crush', False):
+            response['vol_crush'] = create_vol_crush_chart(
+                ticker, expiry_dates=expiry_dates,
+            )
+
+        if data.get('show_gex_profile', False):
+            response['gex_profile'] = create_gex_profile_chart(
+                calls, puts, S, strike_range=strike_range,
+                call_color=call_color, put_color=put_color,
+            )
+
         
         # Open positions for this ticker, enriched with current mid/P&L from
         # the just-fetched chain. Cheap query — runs in one round-trip per /update.
@@ -16392,12 +16857,58 @@ def update():
             except Exception:
                 gex_regime = None
 
+            # --- Theta bleed: total $ premium decay per trading minute ---
+            # theta is per-share-per-day. Total $/day = theta * OI * 100 (per option).
+            # Sum across visible chain, divide by 390 (6.5h × 60m) for $/min.
+            # We use absolute values so the headline is always "decay rate", not signed.
+            theta_bleed = None
+            try:
+                rc_t = calls[(calls['strike'] >= S * (1 - strike_range)) & (calls['strike'] <= S * (1 + strike_range))]
+                rp_t = puts[(puts['strike']  >= S * (1 - strike_range)) & (puts['strike']  <= S * (1 + strike_range))]
+                if 'theta' in rc_t.columns and 'theta' in rp_t.columns:
+                    bleed_per_day = 0.0
+                    if not rc_t.empty:
+                        bleed_per_day += float((rc_t['theta'].abs() * rc_t['openInterest'] * 100).sum())
+                    if not rp_t.empty:
+                        bleed_per_day += float((rp_t['theta'].abs() * rp_t['openInterest'] * 100).sum())
+                    theta_bleed = {
+                        'per_day': round(bleed_per_day, 2),
+                        'per_minute': round(bleed_per_day / 390.0, 2),
+                    }
+            except Exception:
+                theta_bleed = None
+
+            # --- Implied vs realized move ---
+            # Pull morning EM (earliest interval_session_data row today) + compute
+            # realized move so far. Tells you if morning IV was over/underpriced.
+            implied_vs_realized = None
+            try:
+                est = pytz.timezone('US/Eastern')
+                today_str = datetime.now(est).strftime('%Y-%m-%d')
+                em_rows = get_interval_session_data(ticker, date=today_str) or []
+                if em_rows:
+                    open_row = em_rows[0]
+                    open_price = open_row[1]
+                    open_em = open_row[2]
+                    if open_em and open_em > 0 and open_price:
+                        realized = S - open_price
+                        consumed_pct = round(100.0 * abs(realized) / open_em, 1)
+                        implied_vs_realized = {
+                            'open_price': round(open_price, 2),
+                            'open_em': round(open_em, 2),
+                            'realized': round(realized, 2),
+                            'realized_abs': round(abs(realized), 2),
+                            'consumed_pct': consumed_pct,
+                            'breached': abs(realized) > open_em,
+                        }
+            except Exception:
+                implied_vs_realized = None
+
             # --- Always Calculate Expected Move Range (same as chart logic) ---
             expected_move_range = None
             strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
             if strikes_sorted:
                 atm_strike = min(strikes_sorted, key=lambda x: abs(x - S))
-                atm_idx = strikes_sorted.index(atm_strike)
                 def get_mid(df, strike):
                     row = df.loc[df['strike'] == strike]
                     if row is not None and not row.empty:
@@ -16455,6 +16966,8 @@ def update():
                     'put_percentage': put_percentage,
                     'expected_move_range': expected_move_range,
                     'gex_regime': gex_regime,
+                    'theta_bleed': theta_bleed,
+                    'implied_vs_realized': implied_vs_realized,
                 }
         except Exception as e:
             print(f"Error fetching quote data: {e}")
@@ -16475,6 +16988,8 @@ def update():
                 'put_percentage': put_percentage,
                 'expected_move_range': None,
                 'gex_regime': gex_regime,
+                'theta_bleed': None,
+                'implied_vs_realized': None,
             }
         
         return jsonify(response)
@@ -16940,6 +17455,31 @@ def create_alert():
             params['min_strikes_moved'] = float(params.get('min_strikes_moved', 1))
         except (TypeError, ValueError):
             return jsonify({'error': 'wall_shift min_strikes_moved must be numeric'}), 400
+    elif alert_type == 'pin_watch':
+        try:
+            params['strike'] = float(params.get('strike'))
+            params['pct'] = float(params.get('pct', 0.5))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'pin_watch requires numeric params.strike and params.pct'}), 400
+        # Optional time window
+        for k in ('hour_et', 'minute_et'):
+            if k in params and params[k] is not None and params[k] != '':
+                try:
+                    params[k] = int(params[k])
+                except (TypeError, ValueError):
+                    return jsonify({'error': f'pin_watch {k} must be integer if provided'}), 400
+            elif k in params:
+                params[k] = None
+    elif alert_type == 'charm_accel':
+        try:
+            params['abs_value'] = float(params.get('abs_value'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'charm_accel requires numeric params.abs_value'}), 400
+    elif alert_type == 'atm_gamma_threshold':
+        try:
+            params['abs_value'] = float(params.get('abs_value'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'atm_gamma_threshold requires numeric params.abs_value'}), 400
 
     repeat_mode = body.get('repeat_mode', 'one_shot')
     if repeat_mode not in ('one_shot', 'rearm', 'always'):
@@ -17584,19 +18124,12 @@ def scanner_stream(token):
     def generate():
         try:
             yield 'data: {"type":"connected","tickers":' + json.dumps(tickers) + '}\n\n'
-            scan_done = False
             # Keep streaming live quotes after scan completes — close from
             # client side or via long heartbeat timeout.
             while True:
                 try:
                     payload = q.get(timeout=15)
                     yield f'data: {payload}\n\n'
-                    try:
-                        ev = json.loads(payload)
-                        if ev.get('type') == 'done':
-                            scan_done = True
-                    except Exception:
-                        pass
                 except queue.Empty:
                     yield 'data: {"type":"heartbeat"}\n\n'
         except GeneratorExit:
@@ -18705,6 +19238,14 @@ def view_reports():
         breached = []
         if summary.get('em_breached_upper'): breached.append('↑')
         if summary.get('em_breached_lower'): breached.append('↓')
+        # Pin closeout: did the close land near the predicted magnet strike?
+        pin_winner = summary.get('pin_winner_strike')
+        pin_dist = summary.get('pin_winner_distance')
+        if pin_winner is not None and pin_dist is not None:
+            sign = '+' if pin_dist >= 0 else '−'
+            pin_cell = f'${pin_winner:.2f} <span style="color:#888">({sign}${abs(pin_dist):.2f})</span>'
+        else:
+            pin_cell = '—'
         body_rows.append(
             f'<tr><td>{date_str}</td><td><strong>{tk}</strong></td>'
             f'<td>{peak_k or "—"}</td>'
@@ -18714,11 +19255,12 @@ def view_reports():
             f' {"".join(breached)}</td>'
             f'<td>{drift if drift is not None else "—"}</td>'
             f'<td>{rng if rng is not None else "—"}{" %" if rng is not None else ""}</td>'
+            f'<td>{pin_cell}</td>'
             f'<td><a href="/reports/{date_str}?ticker={tk}">json</a></td></tr>'
         )
 
     if not body_rows:
-        body_rows = ['<tr><td colspan="9" style="text-align:center;padding:24px;color:#888">No reports yet — they generate at 16:05 ET on weekdays.</td></tr>']
+        body_rows = ['<tr><td colspan="10" style="text-align:center;padding:24px;color:#888">No reports yet — they generate at 16:05 ET on weekdays.</td></tr>']
 
     html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>EzOptions — Session Reports</title>
 <style>
@@ -18734,7 +19276,7 @@ a{color:#7fafff}
 <h1>📋 Session Reports</h1>
 <div class="subtitle">Auto-generated daily at 16:05 ET. Snapshot of where dealer gamma piled up, EM band accuracy, and call/put centroid drift.</div>
 <table>
-<thead><tr><th>Date</th><th>Ticker</th><th>Peak GEX strike</th><th>Peak GEX value</th><th>ATM flips</th><th>EM acc.</th><th>Centroid drift</th><th>Range</th><th></th></tr></thead>
+<thead><tr><th>Date</th><th>Ticker</th><th>Peak GEX strike</th><th>Peak GEX value</th><th>ATM flips</th><th>EM acc.</th><th>Centroid drift</th><th>Range</th><th>Pin (Δ to close)</th><th></th></tr></thead>
 <tbody>
 """ + "\n".join(body_rows) + """
 </tbody></table></body></html>"""
@@ -18755,7 +19297,6 @@ def internal_stats():
     try:
         stream_info['started'] = bool(getattr(price_streamer, '_started', False))
         with price_streamer._lock:
-            tickers = sorted(price_streamer._queues.keys())
             stream_info['subscribed_tickers'] = list(price_streamer._subscribed)
             stream_info['subscriber_count'] = sum(len(q) for q in price_streamer._queues.values())
     except Exception:
