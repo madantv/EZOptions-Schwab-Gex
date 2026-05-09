@@ -2411,12 +2411,21 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         if not chain_response.ok:
             try:
                 error_data = chain_response.json()
-                error_msg = error_data.get('error', 'Unknown API error')
+                error_msg = error_data.get('error', '')
                 if 'error_description' in error_data:
                     error_msg += f": {error_data['error_description']}"
-                raise Exception(f"Schwab API Error: {error_msg}")
-            except:
-                raise Exception(f"Schwab API Error: {chain_response.status_code} {chain_response.reason}")
+                if 'message' in error_data:
+                    sep = ' — ' if error_msg else ''
+                    error_msg += f"{sep}{error_data['message']}"
+                if not error_msg:
+                    # No recognized keys — dump the whole payload so we can diagnose
+                    error_msg = str(error_data)
+            except (ValueError, KeyError):
+                # Response wasn't JSON — use raw text
+                body_preview = chain_response.text[:500] if chain_response.text else '(empty body)'
+                error_msg = f"{chain_response.status_code} {chain_response.reason}: {body_preview}"
+            print(f"[option_chains] {ticker} {date} → {chain_response.status_code}: {error_msg}")
+            raise Exception(f"Schwab API Error ({chain_response.status_code}): {error_msg}")
         
         chain = chain_response.json()
         S = float(chain.get('underlyingPrice', 0))
@@ -8601,9 +8610,261 @@ def index():
                 display: none;
             }
         }
+
+        /* ── Schwab Account Pane ───────────────────────────────────────── */
+        #acct-pane {
+            background: linear-gradient(180deg, #1a2434 0%, #15202e 100%);
+            border-bottom: 1px solid #2a3a52;
+            color: #eef2f7; font-family: Arial, sans-serif; font-size: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+        }
+        #acct-pane-bar {
+            display: flex; align-items: center; gap: 14px;
+            padding: 6px 12px; user-select: none; min-height: 20px;
+        }
+        #acct-pane-bar .acct-title { font-weight: 600; color: #6cb6ff; }
+        #acct-pane-bar .acct-stat { color: #aab8c8; }
+        #acct-pane-bar .acct-stat b { color: #eef2f7; font-weight: 600; }
+        #acct-pane-bar .acct-pl-pos { color: #4ade80; font-weight: 600; }
+        #acct-pane-bar .acct-pl-neg { color: #f87171; font-weight: 600; }
+        #acct-pane-bar .acct-spacer { flex: 1; }
+        #acct-pane-bar .acct-stamp { color: #6b7a90; font-size: 11px; }
+        #acct-pane-bar .acct-toggle {
+            background: transparent; border: 1px solid #2a3a52; color: #aab8c8;
+            border-radius: 4px; padding: 1px 8px; font-size: 13px; cursor: pointer;
+        }
+        #acct-pane-bar .acct-toggle:hover { background: #243142; color: #eef2f7; }
+        #acct-pane-body {
+            display: none; grid-template-columns: 2fr 1fr; gap: 1px;
+            background: #2a3a52;
+        }
+        #acct-pane-body.acct-expanded {
+            display: grid;
+        }
+        .acct-col { background: #15202e; padding: 6px 10px 8px; overflow: auto; max-height: 340px; }
+        .acct-col h4 {
+            margin: 0 0 4px 0; font-size: 11px; color: #6cb6ff;
+            text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+            position: sticky; top: 0; background: #15202e; padding: 2px 0;
+            cursor: pointer; user-select: none;
+        }
+        .acct-col h4:hover { color: #9dd4ff; }
+        .acct-col-arrow { font-size: 9px; margin-right: 2px; }
+        .acct-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        .acct-table th {
+            text-align: left; color: #6b7a90; font-weight: 500; padding: 2px 6px;
+            border-bottom: 1px solid #243142;
+        }
+        .acct-table td { padding: 2px 6px; border-bottom: 1px solid #1d2838; }
+        .acct-table tr:hover td { background: #1d2838; }
+        .acct-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+        .acct-table .sym { font-weight: 600; color: #eef2f7; white-space: nowrap; }
+        .acct-table .pl-pos { color: #4ade80; }
+        .acct-table .pl-neg { color: #f87171; }
+        .acct-table tr.row-profit td { background: rgba(74, 222, 128, 0.10); border-left: 2px solid transparent; }
+        .acct-table tr.row-loss   td { background: rgba(248, 113, 113, 0.10); border-left: 2px solid transparent; }
+        .acct-table tr.row-profit td:first-child { border-left-color: #4ade80; }
+        .acct-table tr.row-loss   td:first-child { border-left-color: #f87171; }
+        .acct-table tr.row-profit:hover td { background: rgba(74, 222, 128, 0.18); }
+        .acct-table tr.row-loss:hover   td { background: rgba(248, 113, 113, 0.18); }
+        .acct-table tr.expandable { cursor: pointer; }
+        .acct-table tr.expandable .acct-chev {
+            display: inline-block; transition: transform 0.15s ease;
+            color: #6b7a90; font-size: 9px; margin-right: 4px;
+        }
+        .acct-table tr.expandable.is-expanded .acct-chev { transform: rotate(90deg); color: #eef2f7; }
+        .acct-detail-row td { background: #0f1620; padding: 4px 8px 8px 22px; border-left: 2px solid #2a3a52; }
+        .acct-detail-row .acct-table { font-size: 10.5px; }
+        .acct-detail-row .acct-table th { color: #8aa0bf; font-size: 10px; padding: 1px 6px; }
+        .acct-detail-row .acct-table td { padding: 1px 6px; border-bottom: 1px solid #1a2330; }
+        .acct-detail-row .acct-table tr:hover td { background: #182230; }
+        .acct-table .side-buy { color: #4ade80; font-weight: 600; }
+        .acct-table .side-sell { color: #f87171; font-weight: 600; }
+        /* TOS-style grouped position table */
+        .tos-table th { font-size: 10px; text-transform: none; letter-spacing: 0; }
+        .tos-group-hdr td {
+            background: #1e2a3a !important; font-weight: 700; color: #eef2f7;
+            padding: 4px 6px; border-bottom: 1px solid #2a3a52;
+        }
+        .tos-group-hdr .tos-arrow { color: #6cb6ff; font-size: 9px; margin-right: 2px; }
+        .tos-group-hdr .tos-badge {
+            display: inline-block; background: #d4942a; color: #000;
+            font-size: 9px; font-weight: 700; padding: 0 5px;
+            border-radius: 3px; margin-left: 6px; min-width: 14px; text-align: center;
+        }
+        .tos-pos-row td { padding: 2px 6px; }
+        .tos-indent { padding-left: 18px !important; }
+        .tos-dte { color: #aab8c8; }
+        .acct-empty { color: #6b7a90; font-style: italic; padding: 6px 0; font-size: 11px; }
+        .acct-error { color: #f87171; padding: 6px 0; font-size: 11px; }
+        @media (max-width: 700px) {
+            #acct-pane-body { grid-template-columns: 1fr; max-height: 320px; }
+            .acct-col { max-height: 160px; }
+        }
     </style>
 </head>
 <body>
+    <div id="acct-pane" role="region" aria-label="Schwab account positions">
+        <div id="acct-pane-bar">
+            <span class="acct-title">📊 Account</span>
+            <span class="acct-stat"><b id="acct-open-count">—</b> open</span>
+            <span class="acct-stat"><b id="acct-trades-count">—</b> trades</span>
+            <span class="acct-stat"><b id="acct-closed-count">—</b> closed</span>
+            <span class="acct-stat"><b id="acct-symbols-count">—</b> symbols</span>
+            <span class="acct-stat">Liq <b id="acct-liq">—</b></span>
+            <span class="acct-stat">Realized <span id="acct-realized-pl">—</span></span>
+            <span class="acct-stat">Day <span id="acct-day-pl">—</span></span>
+            <span class="acct-spacer"></span>
+            <span class="acct-stamp" id="acct-stamp">—</span>
+            <button class="acct-toggle" id="acct-expand" title="Expand/collapse positions">▼</button>
+            <button class="acct-toggle" id="acct-refresh" title="Refresh now">⟳</button>
+        </div>
+        <div id="acct-pane-body">
+            <div class="acct-col">
+                <h4 class="acct-col-toggle" data-target="acct-open-wrap"><span class="acct-col-arrow">▼</span> Open Positions</h4>
+                <div id="acct-open-wrap"><div class="acct-empty">Loading…</div></div>
+            </div>
+            <div class="acct-col">
+                <h4 class="acct-col-toggle" data-target="acct-by-underlying-wrap"><span class="acct-col-arrow">▼</span> Today by Underlying</h4>
+                <div id="acct-by-underlying-wrap"><div class="acct-empty">Loading…</div></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Gamma Squeeze banner (only visible when score ≥ 70) ─────────────── -->
+    <div id="squeeze-banner" style="display:none;" role="alert">
+        <div class="sqb-row">
+            <span class="sqb-icon">⚡</span>
+            <span class="sqb-label" id="sqb-label">GAMMA SQUEEZE</span>
+            <span class="sqb-score" id="sqb-score">—</span>
+            <span class="sqb-ticker" id="sqb-ticker">—</span>
+            <span class="sqb-signals" id="sqb-signals"></span>
+            <span class="sqb-spacer"></span>
+            <button class="sqb-close" id="sqb-dismiss" title="Hide for this ticker">×</button>
+        </div>
+    </div>
+    <style>
+        #squeeze-banner {
+            position: relative; z-index: 9000;
+            padding: 8px 14px; font-family: Arial, sans-serif; font-size: 13px;
+            color: #fff; border-bottom: 1px solid rgba(255,255,255,0.15);
+        }
+        #squeeze-banner.sqb-active  { background: linear-gradient(90deg, #c2570f 0%, #d97706 100%); }
+        #squeeze-banner.sqb-extreme { background: linear-gradient(90deg, #b91c1c 0%, #dc2626 100%);
+                                       animation: sqbpulse 1.4s ease-in-out infinite; }
+        @keyframes sqbpulse { 0%,100% { box-shadow: inset 0 0 0 0 rgba(255,255,255,0.0); }
+                              50%      { box-shadow: inset 0 0 22px 0 rgba(255,255,255,0.15); } }
+        #squeeze-banner .sqb-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        #squeeze-banner .sqb-icon  { font-size: 16px; }
+        #squeeze-banner .sqb-label { font-weight: 800; letter-spacing: 0.5px; }
+        #squeeze-banner .sqb-score {
+            background: rgba(0,0,0,0.35); padding: 2px 10px; border-radius: 12px;
+            font-weight: 800; font-variant-numeric: tabular-nums;
+        }
+        #squeeze-banner .sqb-ticker { font-weight: 700; }
+        #squeeze-banner .sqb-signals { color: rgba(255,255,255,0.92); font-size: 12px; }
+        #squeeze-banner .sqb-spacer  { flex: 1; }
+        #squeeze-banner .sqb-close   {
+            background: transparent; border: 1px solid rgba(255,255,255,0.35);
+            color: #fff; border-radius: 4px; padding: 1px 8px; font-size: 14px; cursor: pointer;
+        }
+        #squeeze-banner .sqb-close:hover { background: rgba(0,0,0,0.25); }
+    </style>
+    <script>
+    (function () {
+        const $sq = (id) => document.getElementById(id);
+        let pollTimer = null;
+        let dismissedFor = null; // ticker for which banner is currently dismissed
+
+        function getActiveTicker() {
+            const el = document.getElementById('ticker');
+            return el && el.value ? String(el.value).toUpperCase().trim() : '';
+        }
+        function getSelectedExpiries() {
+            return Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked'))
+                .map(cb => cb.value).filter(Boolean);
+        }
+        function getGexSign() {
+            try {
+                const el = document.querySelector('input[name="gex_sign"]:checked');
+                return (el && el.value) || 'dealer';
+            } catch (e) { return 'dealer'; }
+        }
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function hideBanner() {
+            const b = $sq('squeeze-banner');
+            b.style.display = 'none';
+            b.classList.remove('sqb-active', 'sqb-extreme');
+        }
+
+        function showBanner(ticker, sq) {
+            const b = $sq('squeeze-banner');
+            b.classList.remove('sqb-active', 'sqb-extreme');
+            b.classList.add(sq.level === 'extreme' ? 'sqb-extreme' : 'sqb-active');
+            $sq('sqb-label').textContent = sq.level === 'extreme' ? 'EXTREME SQUEEZE' : 'GAMMA SQUEEZE';
+            $sq('sqb-score').textContent = sq.score;
+            $sq('sqb-ticker').textContent = ticker;
+            $sq('sqb-signals').innerHTML = (sq.signal_text || []).map(escapeHtml).join(' · ');
+            b.style.display = '';
+        }
+
+        function poll() {
+            // Skip our own poll if the gamma profile sidebar is open — its
+            // own 5s poller already refreshes /gamma_profile and we hook into
+            // its response below via a custom event.
+            const sidebar = document.getElementById('gp-sidebar');
+            if (sidebar && sidebar.classList.contains('open')) return;
+            const ticker = getActiveTicker();
+            if (!ticker) { hideBanner(); return; }
+            const expiries = getSelectedExpiries();
+            if (!expiries.length) return;
+            fetch('/gamma_profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ticker, expiry: expiries, gex_sign: getGexSign() }),
+            })
+            .then(r => r.ok ? r.json() : null)
+            .then(body => applyBody(body, ticker))
+            .catch(() => {});
+        }
+
+        function applyBody(body, ticker) {
+            if (!body || body.error) return;
+            const sq = body.squeeze;
+            if (!sq) { hideBanner(); return; }
+            // Drop stale payloads whose request-ticker isn't the active one anymore.
+            // (Compare against `ticker` we asked with, not body.ticker — backend
+            // rewrites SPX → $SPX etc.)
+            const currentTk = getActiveTicker();
+            if (currentTk && ticker && currentTk !== ticker) return;
+            const tk = body.ticker || ticker;
+            if (dismissedFor === tk) { hideBanner(); return; }
+            if (sq.score >= 70) showBanner(tk, sq);
+            else hideBanner();
+        }
+        // Allow the gamma profile sidebar to feed us its already-fetched payload.
+        window.addEventListener('squeeze:payload', (e) => {
+            applyBody(e.detail, getActiveTicker());
+        });
+
+        document.addEventListener('DOMContentLoaded', () => {
+            $sq('sqb-dismiss').addEventListener('click', () => {
+                dismissedFor = getActiveTicker();
+                hideBanner();
+            });
+            // Reset dismissal when the user switches tickers.
+            const tk = document.getElementById('ticker');
+            if (tk) tk.addEventListener('change', () => { dismissedFor = null; poll(); });
+
+            poll();
+            pollTimer = setInterval(poll, 60000);
+        });
+    })();
+    </script>
+
     <div id="error-notification">
         <span class="error-close" onclick="hideError()">&times;</span>
         <div id="error-message"></div>
@@ -8863,6 +9124,348 @@ def index():
             } else {
                 startPolling();
             }
+        });
+    })();
+    </script>
+
+    <script>
+    // ── Schwab Account Pane (open positions + today's trades) ──────────────
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const REFRESH_MS = 30 * 1000;
+        let pollTimer = null;
+        let inflight = false;
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+        function fmtUSD(n, opts) {
+            if (n == null || isNaN(n)) return '—';
+            const abs = Math.abs(n);
+            const sign = n < 0 ? '-' : '';
+            if ((opts || {}).compact && abs >= 1000) {
+                if (abs >= 1e6) return sign + '$' + (abs/1e6).toFixed(2) + 'M';
+                return sign + '$' + (abs/1e3).toFixed(1) + 'K';
+            }
+            return sign + '$' + abs.toFixed(2);
+        }
+        function fmtNum(n, dp) {
+            if (n == null || isNaN(n)) return '—';
+            return Number(n).toFixed(dp == null ? 2 : dp);
+        }
+        function fmtTime(iso) {
+            if (!iso) return '—';
+            try {
+                const d = new Date(iso);
+                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch (e) { return '—'; }
+        }
+        function plClass(n) { return n > 0 ? 'pl-pos' : (n < 0 ? 'pl-neg' : ''); }
+
+        function applyPL(elId, val) {
+            const el = $(elId);
+            if (val == null || isNaN(val)) {
+                el.textContent = '—'; el.className = ''; return;
+            }
+            el.textContent = (val > 0 ? '+' : '') + fmtUSD(val, { compact: true });
+            el.className = val > 0 ? 'acct-pl-pos' : (val < 0 ? 'acct-pl-neg' : '');
+        }
+        function setPane(open, dayPL, realizedPL, liq, tradesCount, closedCount, symbolsCount, stamp) {
+            $('acct-open-count').textContent = open;
+            $('acct-trades-count').textContent = tradesCount;
+            $('acct-closed-count').textContent = closedCount;
+            $('acct-symbols-count').textContent = symbolsCount;
+            $('acct-liq').textContent = fmtUSD(liq, { compact: true });
+            applyPL('acct-realized-pl', realizedPL);
+            applyPL('acct-day-pl', dayPL);
+            $('acct-stamp').textContent = stamp ? 'updated ' + fmtTime(stamp) : '—';
+        }
+
+        function rowClass(v) { return v > 0 ? 'row-profit' : (v < 0 ? 'row-loss' : ''); }
+
+        function fmtMark(n) {
+            if (n == null || isNaN(n) || n === 0) return '';
+            const a = Math.abs(n);
+            return a >= 100 ? a.toFixed(2) : (a >= 1 ? a.toFixed(3) : a.toFixed(4));
+        }
+        function fmtChng(n) {
+            if (n == null || isNaN(n)) return '';
+            const sign = n > 0 ? '+' : '';
+            const a = Math.abs(n);
+            return sign + (a >= 100 ? a.toFixed(2) : (a >= 1 ? n.toFixed(2) : n.toFixed(4)));
+        }
+        function fmtPct(n) {
+            if (n == null || isNaN(n)) return '0.00%';
+            return n.toFixed(2) + '%';
+        }
+        function fmtPL(n) {
+            if (n == null || isNaN(n)) return '$0.00';
+            const sign = n > 0 ? '+' : (n < 0 ? '-' : '');
+            return sign + '$' + Math.abs(n).toFixed(2);
+        }
+
+        const OPEN_TABLE_HEADER = '<thead><tr>'
+            + '<th>Instrument</th>'
+            + '<th class="num">Qty</th>'
+            + '<th class="num">Days</th>'
+            + '<th class="num">Trade Price</th>'
+            + '<th class="num">Mark</th>'
+            + '<th class="num">Mrk Chng</th>'
+            + '<th class="num">% Change</th>'
+            + '<th class="num">P/L %</th>'
+            + '<th class="num">P/L Open</th>'
+            + '<th class="num">P/L Day</th>'
+            + '</tr></thead>';
+
+        function renderOpen(positions) {
+            const wrap = $('acct-open-wrap');
+            if (!positions || !positions.length) {
+                wrap.innerHTML = '<table class="acct-table tos-table">'
+                    + OPEN_TABLE_HEADER
+                    + '<tbody><tr><td colspan="10" class="acct-empty" style="text-align:center;">No open positions</td></tr></tbody>'
+                    + '</table>';
+                return;
+            }
+            // Group by underlying
+            const groups = {};
+            const order = [];
+            positions.forEach(p => {
+                const u = p.underlying || p.symbol;
+                if (!groups[u]) { groups[u] = []; order.push(u); }
+                groups[u].push(p);
+            });
+            // Sort groups by total |day_pl| descending
+            order.sort((a, b) => {
+                const sumA = groups[a].reduce((s, p) => s + Math.abs(p.day_pl || 0), 0);
+                const sumB = groups[b].reduce((s, p) => s + Math.abs(p.day_pl || 0), 0);
+                return sumB - sumA;
+            });
+
+            let html = '';
+            let gIdx = 0;
+            order.forEach(u => {
+                const items = groups[u];
+                const totalDayPL = items.reduce((s, p) => s + (p.day_pl || 0), 0);
+                const totalOpenPL = items.reduce((s, p) => s + (p.open_pl || 0), 0);
+                const count = items.length;
+                const plCls = plClass(totalDayPL);
+                const gid = 'tos-g-' + gIdx;
+                gIdx++;
+                // Underlying header row — clickable to expand/collapse
+                html += '<tr class="tos-group-hdr" data-tos-group="' + gid + '" style="cursor:pointer;">'
+                    + '<td class="sym" colspan="4"><span class="tos-arrow" id="arrow-' + gid + '">&#9660;</span> ' + escapeHtml(u) + ' <span class="tos-badge">' + count + '</span></td>'
+                    + '<td></td><td></td>'
+                    + '<td></td>'
+                    + '<td></td>'
+                    + '<td class="num ' + plCls + '">' + fmtPL(totalOpenPL) + '</td>'
+                    + '<td class="num ' + plCls + '">' + fmtPL(totalDayPL) + '</td>'
+                    + '</tr>';
+                // Individual position rows
+                items.forEach(p => {
+                    const sentiment = (p.open_pl != null && p.open_pl !== 0) ? p.open_pl : p.day_pl;
+                    const trCls = rowClass(sentiment);
+                    const dayPlCls = plClass(p.day_pl);
+                    const chngCls = plClass(p.mrk_chng);
+                    const openPlCls = plClass(p.open_pl);
+                    const plPctCls = plClass(p.pl_pct);
+                    const dteStr = (p.dte != null) ? String(p.dte) : '';
+                    const instrument = escapeHtml(p.display_symbol || p.symbol);
+                    // True TOS %Change: instrument price vs prior close. Fall back to position day_pl_pct if missing.
+                    const pctChangeVal = (p.instrument_pct_change != null) ? p.instrument_pct_change : p.day_pl_pct;
+                    const pctChangeCls = plClass(pctChangeVal);
+                    const pctChangeTitle = (p.instrument_pct_change != null && p.closing_price)
+                        ? ' title="vs prior close ' + fmtMark(p.closing_price) + '"' : '';
+                    html += '<tr class="tos-pos-row ' + trCls + '" data-tos-child="' + gid + '">'
+                        + '<td class="sym tos-indent">' + instrument + '</td>'
+                        + '<td class="num">' + fmtNum(p.quantity, 0) + '</td>'
+                        + '<td class="num tos-dte">' + dteStr + '</td>'
+                        + '<td class="num">' + fmtMark(p.avg_price) + '</td>'
+                        + '<td class="num">' + fmtMark(p.mark_price) + '</td>'
+                        + '<td class="num ' + chngCls + '">' + fmtChng(p.mrk_chng) + '</td>'
+                        + '<td class="num ' + pctChangeCls + '"' + pctChangeTitle + '>' + fmtPct(pctChangeVal) + '</td>'
+                        + '<td class="num ' + plPctCls + '">' + fmtPct(p.pl_pct) + '</td>'
+                        + '<td class="num ' + openPlCls + '">' + fmtPL(p.open_pl) + '</td>'
+                        + '<td class="num ' + dayPlCls + '">' + fmtPL(p.day_pl) + '</td>'
+                        + '</tr>';
+                });
+            });
+            wrap.innerHTML = '<table class="acct-table tos-table">'
+                + OPEN_TABLE_HEADER
+                + '<tbody>' + html + '</tbody></table>';
+
+        }
+
+        // Track which underlyings are expanded across re-renders.
+        const expandedUnderlyings = new Set();
+
+        function legsTableHtml(legs) {
+            if (!legs || !legs.length) {
+                return '<div class="acct-empty">No leg detail</div>';
+            }
+            const trs = legs.map(L => {
+                const pl = L.realized_pl;
+                const cls = pl > 0 ? 'pl-pos' : (pl < 0 ? 'pl-neg' : '');
+                const sign = pl > 0 ? '+' : '';
+                const trCls = rowClass(pl);
+                const plCell = L.realized_known
+                    ? '<td class="num ' + cls + '">' + sign + fmtUSD(pl) + '</td>'
+                    : '<td class="num" title="some closes had no matching open today">' + sign + fmtUSD(pl) + '*</td>';
+                return '<tr class="' + trCls + '">'
+                    + '<td class="sym">' + escapeHtml(L.display_symbol || L.symbol) + '</td>'
+                    + '<td class="num">' + fmtNum(L.trades, 0) + '</td>'
+                    + '<td class="num">' + fmtNum(L.contracts_closed, 0) + '/' + fmtNum(L.contracts_opened, 0) + '</td>'
+                    + plCell
+                    + '</tr>';
+            }).join('');
+            return '<table class="acct-table">'
+                + '<thead><tr><th>Contract</th><th class="num">Trades</th><th class="num" title="closed/opened">C/O</th><th class="num">Realized P/L</th></tr></thead>'
+                + '<tbody>' + trs + '</tbody></table>';
+        }
+
+        function renderByUnderlying(rows) {
+            const wrap = $('acct-by-underlying-wrap');
+            if (!rows || !rows.length) {
+                wrap.innerHTML = '<div class="acct-empty">No trades today</div>';
+                return;
+            }
+            // Drop any expanded keys that no longer exist in the latest payload.
+            const aliveKeys = new Set(rows.map(r => r.underlying));
+            for (const k of Array.from(expandedUnderlyings)) if (!aliveKeys.has(k)) expandedUnderlyings.delete(k);
+
+            const out = [];
+            rows.forEach(r => {
+                const pl = r.realized_pl;
+                const cls = pl > 0 ? 'pl-pos' : (pl < 0 ? 'pl-neg' : '');
+                const sign = pl > 0 ? '+' : '';
+                const trCls = rowClass(pl);
+                const expanded = expandedUnderlyings.has(r.underlying);
+                const plCell = r.realized_known
+                    ? '<td class="num ' + cls + '">' + sign + fmtUSD(pl) + '</td>'
+                    : '<td class="num" title="includes closes with no matching open today">' + sign + fmtUSD(pl) + '*</td>';
+                out.push(
+                    '<tr class="expandable ' + trCls + (expanded ? ' is-expanded' : '') + '" data-underlying="' + escapeHtml(r.underlying) + '">'
+                    + '<td class="sym"><span class="acct-chev">▸</span>' + escapeHtml(r.underlying) + '</td>'
+                    + '<td class="num">' + fmtNum(r.trades, 0) + '</td>'
+                    + '<td class="num">' + fmtNum(r.contracts_closed, 0) + '/' + fmtNum(r.contracts_opened, 0) + '</td>'
+                    + plCell
+                    + '</tr>'
+                );
+                if (expanded) {
+                    out.push(
+                        '<tr class="acct-detail-row" data-detail-of="' + escapeHtml(r.underlying) + '">'
+                        + '<td colspan="4">' + legsTableHtml(r.legs || []) + '</td>'
+                        + '</tr>'
+                    );
+                }
+            });
+            wrap.innerHTML = '<table class="acct-table">'
+                + '<thead><tr><th>Underlying</th><th class="num">Trades</th><th class="num" title="closed/opened">C/O</th><th class="num">Realized P/L</th></tr></thead>'
+                + '<tbody>' + out.join('') + '</tbody></table>';
+        }
+
+        function bindByUnderlyingClicks() {
+            $('acct-by-underlying-wrap').addEventListener('click', (e) => {
+                const tr = e.target.closest('tr.expandable');
+                if (!tr) return;
+                const u = tr.getAttribute('data-underlying');
+                if (!u) return;
+                if (expandedUnderlyings.has(u)) expandedUnderlyings.delete(u);
+                else expandedUnderlyings.add(u);
+                // Re-render is driven by next refresh; for snappier UX, toggle now too.
+                if (window._lastByU) renderByUnderlying(window._lastByU);
+                requestAnimationFrame(updatePaneHeight);
+            });
+        }
+
+        function renderError(msg) {
+            $('acct-open-wrap').innerHTML = '<div class="acct-error">' + escapeHtml(msg) + '</div>';
+            $('acct-by-underlying-wrap').innerHTML = '';
+            $('acct-stamp').textContent = 'error';
+        }
+
+        function refresh() {
+            if (inflight) return;
+            inflight = true;
+            fetch('/account_positions')
+                .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
+                .then(({ ok, body }) => {
+                    if (!ok || body.error) {
+                        renderError(body.error || ('HTTP ' + (ok ? 'OK' : 'error')));
+                        setPane('—', 0, 0, null, '—', '—', '—', null);
+                        return;
+                    }
+                    const open = body.open || [];
+                    const trades = body.today_trades || [];
+                    const closed = trades.filter(t => (t.position_effect || '').toUpperCase() === 'CLOSING');
+                    const byU = body.by_underlying || [];
+                    const totals = body.totals || {};
+                    const totalDay = (totals.total_day_pl != null) ? totals.total_day_pl : (totals.day_pl || 0);
+                    setPane(open.length, totalDay, totals.realized_day_pl || 0, totals.liquidation_value || 0, trades.length, closed.length, byU.length, body.updated_at);
+                    renderOpen(open);
+                    window._lastByU = byU;
+                    renderByUnderlying(byU);
+                })
+                .catch(err => renderError('Network error: ' + err))
+                .finally(() => { inflight = false; });
+        }
+
+        function updatePaneHeight() {
+            const pane = $('acct-pane');
+            if (!pane) return;
+            const h = pane.getBoundingClientRect().height;
+            document.documentElement.style.setProperty('--acct-pane-h', Math.ceil(h) + 'px');
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            $('acct-refresh').addEventListener('click', refresh);
+            bindByUnderlyingClicks();
+
+            // Expand/collapse toggle for the positions body
+            $('acct-expand').addEventListener('click', function() {
+                const body = $('acct-pane-body');
+                const isOpen = body.classList.toggle('acct-expanded');
+                this.textContent = isOpen ? '▲' : '▼';
+                updatePaneHeight();
+            });
+
+            // Delegated click handler for TOS group headers (survives innerHTML refresh)
+            $('acct-open-wrap').addEventListener('click', function(e) {
+                const hdr = e.target.closest('.tos-group-hdr');
+                if (!hdr) return;
+                const gid = hdr.getAttribute('data-tos-group');
+                if (!gid) return;
+                const arrow = document.getElementById('arrow-' + gid);
+                const children = this.querySelectorAll('[data-tos-child="' + gid + '"]');
+                if (!children.length) return;
+                const isOpen = children[0].style.display !== 'none';
+                children.forEach(r => { r.style.display = isOpen ? 'none' : ''; });
+                if (arrow) arrow.innerHTML = isOpen ? '&#9654;' : '&#9660;';
+            });
+
+            // Section-level collapse for Open Positions / Today by Underlying
+            document.querySelectorAll('.acct-col-toggle').forEach(h4 => {
+                h4.addEventListener('click', function() {
+                    const target = document.getElementById(this.getAttribute('data-target'));
+                    if (!target) return;
+                    const arrow = this.querySelector('.acct-col-arrow');
+                    const isOpen = target.style.display !== 'none';
+                    target.style.display = isOpen ? 'none' : '';
+                    arrow.textContent = isOpen ? '▶' : '▼';
+                    updatePaneHeight();
+                });
+            });
+
+            // Also allow clicking the bar stats area to toggle
+            $('acct-pane-bar').addEventListener('click', function(e) {
+                if (e.target.closest('button')) return; // don't toggle on button clicks
+                $('acct-expand').click();
+            });
+
+            window.addEventListener('resize', updatePaneHeight);
+            updatePaneHeight();
+
+            refresh();
+            pollTimer = setInterval(refresh, REFRESH_MS);
         });
     })();
     </script>
@@ -15778,6 +16381,24 @@ def index():
                 <div class="gp-levels" id="gp-levels"></div>
             </div>
 
+            <div class="gp-card gp-squeeze-card" id="gp-squeeze-card">
+                <div class="gp-squeeze-head">
+                    <span class="gp-card-title">⚡ SQUEEZE METER</span>
+                    <span class="gp-squeeze-score-chip" id="gp-sq-chip">—</span>
+                </div>
+                <div class="gp-squeeze-meter">
+                    <div class="gp-squeeze-fill" id="gp-sq-fill"></div>
+                    <div class="gp-squeeze-marks">
+                        <span style="left:50%">50</span>
+                        <span style="left:70%">70</span>
+                        <span style="left:85%">85</span>
+                    </div>
+                </div>
+                <div class="gp-squeeze-level" id="gp-sq-level">No squeeze signal</div>
+                <div class="gp-squeeze-signals" id="gp-sq-signals"></div>
+                <div class="gp-squeeze-breakdown" id="gp-sq-breakdown"></div>
+            </div>
+
             <div class="gp-card gp-chain-card">
                 <div class="gp-chain-head">
                     <span class="gp-card-title">📈 CHAIN ACTIVITY</span>
@@ -15881,6 +16502,64 @@ def index():
         }
         #gp-sidebar .gp-pill-mute { background: rgba(255,255,255,0.06); color: var(--text-secondary, #ccc); }
         #gp-sidebar .gp-pill-warn { background: rgba(255,196,0,0.15); color: #ffcc55; border: 1px solid rgba(255,196,0,0.4); }
+
+        /* Squeeze meter card */
+        #gp-sidebar .gp-squeeze-card.is-active  { border: 1px solid rgba(255,140,0,0.55); box-shadow: 0 0 0 1px rgba(255,140,0,0.3) inset; }
+        #gp-sidebar .gp-squeeze-card.is-extreme { border: 1px solid rgba(248,113,113,0.7);  box-shadow: 0 0 0 1px rgba(248,113,113,0.4) inset;
+                                                   animation: gpsqpulse 1.6s ease-in-out infinite; }
+        @keyframes gpsqpulse { 0%,100% { box-shadow: 0 0 0 1px rgba(248,113,113,0.4) inset, 0 0 12px 0 rgba(248,113,113,0.0); }
+                               50%      { box-shadow: 0 0 0 1px rgba(248,113,113,0.4) inset, 0 0 12px 2px rgba(248,113,113,0.45); } }
+        #gp-sidebar .gp-squeeze-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        #gp-sidebar .gp-squeeze-score-chip {
+            font-size: 14px; font-weight: 800; padding: 3px 10px; border-radius: 12px;
+            background: rgba(255,255,255,0.08); color: #888; min-width: 36px; text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+        #gp-sidebar .gp-squeeze-card.lvl-watching .gp-squeeze-score-chip { background: rgba(255,221,87,0.18); color: #ffd700; }
+        #gp-sidebar .gp-squeeze-card.lvl-active   .gp-squeeze-score-chip { background: rgba(255,140,0,0.25); color: #ff9b3c; }
+        #gp-sidebar .gp-squeeze-card.lvl-extreme  .gp-squeeze-score-chip { background: rgba(248,113,113,0.30); color: #ff5c5c; }
+        #gp-sidebar .gp-squeeze-meter {
+            position: relative; height: 8px; background: rgba(255,255,255,0.06);
+            border-radius: 4px; margin: 10px 0 22px 0; overflow: visible;
+        }
+        #gp-sidebar .gp-squeeze-fill {
+            height: 100%; width: 0%; border-radius: 4px;
+            transition: width 0.4s ease, background 0.3s ease;
+            background: linear-gradient(90deg, #6b7a90 0%, #6b7a90 100%);
+        }
+        #gp-sidebar .gp-squeeze-card.lvl-watching .gp-squeeze-fill { background: linear-gradient(90deg, #c2a04a 0%, #ffd700 100%); }
+        #gp-sidebar .gp-squeeze-card.lvl-active   .gp-squeeze-fill { background: linear-gradient(90deg, #c2570f 0%, #ff9b3c 100%); }
+        #gp-sidebar .gp-squeeze-card.lvl-extreme  .gp-squeeze-fill { background: linear-gradient(90deg, #b91c1c 0%, #ff5c5c 100%); }
+        #gp-sidebar .gp-squeeze-marks { position: absolute; top: 100%; left: 0; right: 0; font-size: 9px; color: #6b7a90; }
+        #gp-sidebar .gp-squeeze-marks span { position: absolute; transform: translateX(-50%); margin-top: 2px; }
+        #gp-sidebar .gp-squeeze-marks span::before { content: ''; position: absolute; top: -10px; left: 50%; width: 1px; height: 6px; background: rgba(255,255,255,0.15); }
+        #gp-sidebar .gp-squeeze-level { font-size: 12px; font-weight: 700; margin-top: 4px; color: #aab8c8; }
+        #gp-sidebar .gp-squeeze-card.lvl-watching .gp-squeeze-level { color: #ffd700; }
+        #gp-sidebar .gp-squeeze-card.lvl-active   .gp-squeeze-level { color: #ff9b3c; }
+        #gp-sidebar .gp-squeeze-card.lvl-extreme  .gp-squeeze-level { color: #ff5c5c; }
+        #gp-sidebar .gp-squeeze-signals {
+            font-size: 11px; color: #d2dae6; margin-top: 6px; line-height: 1.5;
+        }
+        #gp-sidebar .gp-squeeze-signals .gp-sq-empty { color: #6b7a90; font-style: italic; }
+        #gp-sidebar .gp-squeeze-breakdown {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px;
+            margin-top: 10px; font-size: 10.5px; color: #aab8c8;
+        }
+        #gp-sidebar .gp-squeeze-breakdown .gp-sqb-row {
+            display: flex; justify-content: space-between; align-items: center; gap: 6px;
+        }
+        #gp-sidebar .gp-squeeze-breakdown .gp-sqb-label { color: #8aa0bf; }
+        #gp-sidebar .gp-squeeze-breakdown .gp-sqb-bar {
+            flex: 1; height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px; margin: 0 6px;
+            position: relative;
+        }
+        #gp-sidebar .gp-squeeze-breakdown .gp-sqb-bar-fill {
+            position: absolute; top: 0; left: 0; height: 100%; border-radius: 2px;
+            background: #6cb6ff;
+        }
+        #gp-sidebar .gp-squeeze-breakdown .gp-sqb-val {
+            font-variant-numeric: tabular-nums; color: #eef2f7; font-weight: 600; min-width: 24px; text-align: right;
+        }
 
         #gp-sidebar .gp-totals-card { display: flex; gap: 10px; }
         #gp-sidebar .gp-stat { flex: 1; }
@@ -16216,6 +16895,55 @@ def index():
             $('gp-vol-put').textContent  = fmtVol(pv) + ' Put';
             $('gp-oi-call').textContent  = fmtVol(co) + ' Call';
             $('gp-oi-put').textContent   = fmtVol(po) + ' Put';
+
+            // Squeeze meter
+            renderSqueeze(payload.squeeze);
+        }
+
+        const SQ_LEVEL_LABELS = {
+            none: 'No squeeze signal',
+            watching: 'Watching — building pressure',
+            active: 'ACTIVE squeeze',
+            extreme: 'EXTREME squeeze',
+        };
+        const SQ_SIGNAL_LABELS = {
+            call_wall: 'Call wall',
+            negative_gex: 'Dealer γ',
+            call_volume: 'Call/Put vol',
+            momentum: 'Momentum',
+        };
+        function renderSqueeze(sq) {
+            const card = $('gp-squeeze-card');
+            card.classList.remove('lvl-none','lvl-watching','lvl-active','lvl-extreme','is-active','is-extreme');
+            if (!sq) {
+                $('gp-sq-chip').textContent = '—';
+                $('gp-sq-fill').style.width = '0%';
+                $('gp-sq-level').textContent = SQ_LEVEL_LABELS.none;
+                $('gp-sq-signals').innerHTML = '<span class="gp-sq-empty">No data</span>';
+                $('gp-sq-breakdown').innerHTML = '';
+                return;
+            }
+            const lvl = sq.level || 'none';
+            card.classList.add('lvl-' + lvl);
+            if (lvl === 'active' || lvl === 'extreme') card.classList.add(lvl === 'extreme' ? 'is-extreme' : 'is-active');
+            $('gp-sq-chip').textContent = sq.score;
+            $('gp-sq-fill').style.width = Math.min(100, Math.max(0, sq.score)) + '%';
+            $('gp-sq-level').textContent = SQ_LEVEL_LABELS[lvl] || lvl;
+            const sigs = sq.signal_text || [];
+            $('gp-sq-signals').innerHTML = sigs.length
+                ? sigs.map(s => '<div>• ' + escapeHtml(s) + '</div>').join('')
+                : '<span class="gp-sq-empty">No signals tripped</span>';
+            const sd = sq.signals || {};
+            const order = ['call_wall', 'negative_gex', 'call_volume', 'momentum'];
+            $('gp-sq-breakdown').innerHTML = order.map(k => {
+                const v = sd[k] || 0;
+                const pctOf25 = Math.round((v / 25) * 100);
+                return '<div class="gp-sqb-row">'
+                    + '<span class="gp-sqb-label">' + SQ_SIGNAL_LABELS[k] + '</span>'
+                    + '<span class="gp-sqb-bar"><span class="gp-sqb-bar-fill" style="width:' + pctOf25 + '%"></span></span>'
+                    + '<span class="gp-sqb-val">' + v + '</span>'
+                    + '</div>';
+            }).join('');
         }
 
         function showError(msg) {
@@ -16238,13 +16966,43 @@ def index():
             })
             .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
             .then(({ ok, body }) => {
+                // Drop responses whose ticker no longer matches the active one
+                // (user switched tickers while this fetch was in-flight).
+                // Compare against the ticker we *requested* with, not the one
+                // the backend echoed back — backend rewrites SPX→$SPX etc.
+                const currentTicker = getActiveTicker();
+                if (currentTicker && ticker && currentTicker !== ticker) return;
                 if (!ok || body.error) {
                     showError(body.error || 'Failed to load gamma profile');
                     return;
                 }
                 render(body);
+                // Forward to the squeeze banner so it doesn't run its own poll
+                // while we're already fetching every 5s.
+                try { window.dispatchEvent(new CustomEvent('squeeze:payload', { detail: body })); } catch (e) {}
             })
             .catch(err => showError('Network error: ' + err));
+        }
+
+        function clearSidebarValues() {
+            // Reset to empty/placeholder while the new ticker's data is fetched,
+            // so the UI never displays values from the prior ticker.
+            const setText = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+            setText('gp-date', '—');
+            const dteEl = $('gp-dte-pill'); if (dteEl) dteEl.style.display = 'none';
+            const zeroEl = $('gp-dte-zero'); if (zeroEl) zeroEl.style.display = 'none';
+            setText('gp-gex', '—'); setText('gp-dex', '—');
+            const gexEl = $('gp-gex'); if (gexEl) gexEl.className = 'gp-stat-value';
+            const dexEl = $('gp-dex'); if (dexEl) dexEl.className = 'gp-stat-value';
+            setText('gp-regime-label', '—');
+            setText('gp-regime-desc', '');
+            const dot = $('gp-regime-dot'); if (dot) { dot.classList.remove('gp-neg','gp-mix'); dot.textContent = '●'; }
+            const lvls = $('gp-levels'); if (lvls) lvls.innerHTML = '';
+            setText('gp-vol-ratio', '—'); setText('gp-oi-ratio', '—');
+            ['gp-vol-call','gp-vol-put','gp-oi-call','gp-oi-put'].forEach(id => setText(id, '—'));
+            const vBar = $('gp-vol-bar-call'); if (vBar) vBar.style.width = '0%';
+            const oBar = $('gp-oi-bar-call'); if (oBar) oBar.style.width = '0%';
+            renderSqueeze(null);
         }
 
         function startPolling() {
@@ -16273,7 +17031,10 @@ def index():
             // sidebar is open so the panel always reflects the active context.
             const tickerEl = document.getElementById('ticker');
             if (tickerEl) tickerEl.addEventListener('change', () => {
-                if (sidebar.classList.contains('open')) refreshGammaProfile();
+                if (sidebar.classList.contains('open')) {
+                    clearSidebarValues();   // wipe stale values immediately
+                    refreshGammaProfile();
+                }
             });
             document.addEventListener('change', (e) => {
                 if (e.target && e.target.matches('.expiry-option input[type="checkbox"]')) {
@@ -17289,6 +18050,302 @@ def _read_token_db(db_path):
     return {'access_token_issued': row[0], 'refresh_token_issued': row[1], 'access_token': row[2]}
 
 
+def _format_option_symbol(occ: str) -> str:
+    """Best-effort pretty-print for an OCC option symbol like 'AAPL  240920C00150000'."""
+    try:
+        s = (occ or '').strip()
+        if len(s) < 15 or ' ' not in s:
+            return occ
+        underlying, rest = s.split(' ', 1)
+        rest = rest.strip()
+        if len(rest) < 15:
+            return occ
+        yy, mm, dd = rest[0:2], rest[2:4], rest[4:6]
+        cp = rest[6]
+        strike_int = int(rest[7:12])
+        strike_dec = int(rest[12:15])
+        strike = strike_int + strike_dec / 1000.0
+        strike_s = f'{strike:g}'
+        return f'{underlying} {int(mm)}/{int(dd)}/{yy} ${strike_s} {cp}'
+    except Exception:
+        return occ
+
+
+def _schwab_account_positions_payload():
+    """Fetch Schwab account positions + today's trades. Returns dict suitable for JSON."""
+    if client is None:
+        return {'error': 'Schwab client not initialized', 'open': [], 'today_trades': []}
+
+    try:
+        la = client.linked_accounts()
+        if not getattr(la, 'ok', False):
+            return {'error': f'linked_accounts {la.status_code}', 'open': [], 'today_trades': []}
+        linked = la.json() or []
+    except Exception as e:
+        return {'error': f'linked_accounts: {e}', 'open': [], 'today_trades': []}
+
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    # schwabdev's _time_convert mangles tz-aware datetimes (produces e.g.
+    # '2026-05-08T00:00:00-04Z' which Schwab rejects). Pass UTC ISO strings.
+    import datetime as _dtmod
+    start_utc_str = start_et.astimezone(_dtmod.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    end_utc_str = now_et.astimezone(_dtmod.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+    open_positions = []
+    today_trades = []
+    totals = {'liquidation_value': 0.0, 'cash': 0.0, 'day_pl': 0.0}
+
+    for entry in linked:
+        h = entry.get('hashValue')
+        acct_num = entry.get('accountNumber', '')
+        if not h:
+            continue
+        # Open positions (live)
+        try:
+            r = client.account_details(h, fields='positions')
+            if r.ok:
+                acct = (r.json() or {}).get('securitiesAccount', {}) or {}
+                cb = acct.get('currentBalances', {}) or {}
+                totals['liquidation_value'] += float(cb.get('liquidationValue') or 0)
+                totals['cash'] += float(cb.get('cashBalance') or 0)
+                for p in (acct.get('positions') or []):
+                    inst = p.get('instrument', {}) or {}
+                    qty_long = float(p.get('longQuantity') or 0)
+                    qty_short = float(p.get('shortQuantity') or 0)
+                    qty = qty_long - qty_short
+                    asset_type = inst.get('assetType', '')
+                    sym = inst.get('symbol', '')
+                    display_sym = _format_option_symbol(sym) if asset_type == 'OPTION' else sym
+                    day_pl = float(p.get('currentDayProfitLoss') or 0)
+                    totals['day_pl'] += day_pl
+                    avg_price = float(p.get('averagePrice') or 0)
+                    market_value = float(p.get('marketValue') or 0)
+                    open_pl = float(p.get('longOpenProfitLoss') or 0) + float(p.get('shortOpenProfitLoss') or 0)
+                    # Compute mark price and mark change
+                    multiplier = 100.0 if asset_type == 'OPTION' else 1.0
+                    if abs(qty) > 1e-9:
+                        mark_price = market_value / (qty * multiplier)
+                        mrk_chng = day_pl / (qty * multiplier)
+                    else:
+                        mark_price = 0.0
+                        mrk_chng = 0.0
+                    # Compute DTE for options
+                    dte = None
+                    if asset_type == 'OPTION':
+                        try:
+                            raw = (sym or '').strip()
+                            _, rest = raw.split(' ', 1)
+                            rest = rest.strip()
+                            yy, mm_s, dd_s = int(rest[0:2]), int(rest[2:4]), int(rest[4:6])
+                            import datetime as _dtmod2
+                            expiry = _dtmod2.date(2000 + yy, mm_s, dd_s)
+                            dte = (expiry - now_et.date()).days
+                        except Exception:
+                            dte = None
+                    # Compute P/L %
+                    cost_basis = avg_price * abs(qty) * multiplier
+                    pl_pct = (open_pl / cost_basis * 100.0) if abs(cost_basis) > 1e-9 else 0.0
+                    # True TOS-style %Change: instrument price vs prior close.
+                    closing_price = float(inst.get('closingPrice') or 0)
+                    if closing_price > 0 and mark_price > 0:
+                        instrument_pct_change = (mark_price - closing_price) / closing_price * 100.0
+                    else:
+                        instrument_pct_change = None
+                    open_positions.append({
+                        'account': acct_num[-4:] if acct_num else '',
+                        'symbol': sym,
+                        'display_symbol': display_sym,
+                        'asset_type': asset_type,
+                        'underlying': inst.get('underlyingSymbol') or sym,
+                        'put_call': inst.get('putCall'),
+                        'quantity': qty,
+                        'avg_price': avg_price,
+                        'market_value': market_value,
+                        'mark_price': round(mark_price, 4),
+                        'mrk_chng': round(mrk_chng, 4),
+                        'dte': dte,
+                        'day_pl': day_pl,
+                        'day_pl_pct': float(p.get('currentDayProfitLossPercentage') or 0),
+                        'instrument_pct_change': round(instrument_pct_change, 2) if instrument_pct_change is not None else None,
+                        'closing_price': closing_price,
+                        'pl_pct': round(pl_pct, 2),
+                        'open_pl': open_pl,
+                    })
+        except Exception as e:
+            print(f"[account_positions] account_details({acct_num[-4:]}): {e}")
+
+        # Today's trades (transactions of type TRADE between midnight ET and now)
+        try:
+            r = client.transactions(h, startDate=start_utc_str, endDate=end_utc_str, types='TRADE')
+            if r.ok:
+                for t in (r.json() or []):
+                    # Primary leg = the security being traded, not the fee/currency rows.
+                    legs = t.get('transferItems') or []
+                    primary = None
+                    for leg in legs:
+                        inst = leg.get('instrument') or {}
+                        if leg.get('feeType'):
+                            continue
+                        if inst.get('assetType') in (None, 'CURRENCY'):
+                            continue
+                        primary = leg
+                        break
+                    if primary is None:
+                        continue
+                    inst = primary.get('instrument') or {}
+                    sym = inst.get('symbol', '')
+                    asset_type = inst.get('assetType', '')
+                    display_sym = _format_option_symbol(sym) if asset_type == 'OPTION' else sym
+                    amount = float(primary.get('amount') or 0)
+                    price = float(primary.get('price') or 0)
+                    pos_effect = primary.get('positionEffect') or ''
+                    side = 'BUY' if amount > 0 else 'SELL'
+                    today_trades.append({
+                        'account': acct_num[-4:] if acct_num else '',
+                        'time': t.get('tradeDate') or t.get('time') or '',
+                        'symbol': sym,
+                        'display_symbol': display_sym,
+                        'asset_type': asset_type,
+                        'side': side,
+                        'position_effect': pos_effect,
+                        'quantity': abs(amount),
+                        'price': price,
+                        'net_amount': float(t.get('netAmount') or 0),
+                    })
+            else:
+                print(f"[account_positions] transactions({acct_num[-4:]}) HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[account_positions] transactions({acct_num[-4:]}): {e}")
+
+    # Per-trade realized P&L via FIFO match within today's trades.
+    from collections import defaultdict, deque
+    lots = defaultdict(deque)  # (acct, sym) -> deque of [qty_remaining, cost_per_unit]
+    realized_day = 0.0
+    for t in sorted(today_trades, key=lambda x: x.get('time') or ''):
+        key = (t['account'], t['symbol'])
+        qty = float(t.get('quantity') or 0)
+        net = float(t.get('net_amount') or 0)
+        effect = t.get('position_effect') or ''
+        if effect == 'OPENING':
+            if qty > 0:
+                # Cost basis per unit (positive for longs paid, negative for shorts received).
+                lots[key].append([qty, -net / qty])
+            t['realized_pl'] = None
+        elif effect == 'CLOSING':
+            remaining = qty
+            cost_basis = 0.0
+            while remaining > 1e-9 and lots[key]:
+                lot = lots[key][0]
+                take = min(remaining, lot[0])
+                cost_basis += take * lot[1]
+                lot[0] -= take
+                remaining -= take
+                if lot[0] <= 1e-9:
+                    lots[key].popleft()
+            if remaining > 1e-9:
+                t['realized_pl'] = None  # no matching open lot today
+            else:
+                t['realized_pl'] = net - cost_basis
+                realized_day += t['realized_pl']
+        else:
+            t['realized_pl'] = None
+
+    totals['realized_day_pl'] = realized_day
+    totals['total_day_pl'] = totals['day_pl'] + realized_day
+
+    # Aggregate today's activity by underlying — the day-trading summary view.
+    by_under = {}
+    for t in today_trades:
+        under = t.get('underlying') or t.get('symbol')
+        if t.get('asset_type') == 'OPTION':
+            sym = t.get('symbol', '')
+            head = sym.split(' ', 1)[0].strip()
+            if head:
+                under = head
+        agg = by_under.setdefault(under, {
+            'underlying': under,
+            'trades': 0,
+            'opens': 0,
+            'closes': 0,
+            'contracts_opened': 0.0,
+            'contracts_closed': 0.0,
+            'realized_pl': 0.0,
+            'realized_known': True,
+            'last_time': '',
+        })
+        agg['trades'] += 1
+        qty = float(t.get('quantity') or 0)
+        eff = t.get('position_effect') or ''
+        if eff == 'OPENING':
+            agg['opens'] += 1
+            agg['contracts_opened'] += qty
+        elif eff == 'CLOSING':
+            agg['closes'] += 1
+            agg['contracts_closed'] += qty
+            if t.get('realized_pl') is None:
+                agg['realized_known'] = False
+            else:
+                agg['realized_pl'] += float(t['realized_pl'])
+        if t.get('time', '') > agg['last_time']:
+            agg['last_time'] = t.get('time', '')
+
+    # Per-leg (option contract / equity symbol) breakdown nested under each underlying.
+    legs_by_under = {}
+    for t in today_trades:
+        under = t.get('underlying') or t.get('symbol')
+        if t.get('asset_type') == 'OPTION':
+            head = (t.get('symbol', '') or '').split(' ', 1)[0].strip()
+            if head:
+                under = head
+        legs = legs_by_under.setdefault(under, {})
+        sym = t.get('symbol', '')
+        leg = legs.setdefault(sym, {
+            'symbol': sym,
+            'display_symbol': t.get('display_symbol') or sym,
+            'asset_type': t.get('asset_type', ''),
+            'trades': 0,
+            'contracts_opened': 0.0,
+            'contracts_closed': 0.0,
+            'realized_pl': 0.0,
+            'realized_known': True,
+        })
+        leg['trades'] += 1
+        qty = float(t.get('quantity') or 0)
+        eff = t.get('position_effect') or ''
+        if eff == 'OPENING':
+            leg['contracts_opened'] += qty
+        elif eff == 'CLOSING':
+            leg['contracts_closed'] += qty
+            if t.get('realized_pl') is None:
+                leg['realized_known'] = False
+            else:
+                leg['realized_pl'] += float(t['realized_pl'])
+
+    by_underlying = sorted(by_under.values(), key=lambda x: abs(x['realized_pl']), reverse=True)
+    for row in by_underlying:
+        legs_dict = legs_by_under.get(row['underlying'], {})
+        row['legs'] = sorted(legs_dict.values(), key=lambda x: abs(x['realized_pl']), reverse=True)
+
+    today_trades.sort(key=lambda x: x.get('time') or '', reverse=True)
+    open_positions.sort(key=lambda x: abs(x.get('day_pl', 0) or 0), reverse=True)
+
+    return {
+        'open': open_positions,
+        'today_trades': today_trades,
+        'by_underlying': by_underlying,
+        'totals': totals,
+        'updated_at': now_et.isoformat(),
+    }
+
+
+@app.route('/account_positions')
+def account_positions():
+    """Live Schwab account: open positions + today's filled trades."""
+    return jsonify(_schwab_account_positions_payload())
+
+
 @app.route('/token_health')
 def token_health():
     """Return Schwab token status and API connectivity check as JSON."""
@@ -17934,7 +18991,8 @@ class _TaggingForwarder:
 def _scanner_quote_snapshot(ticker):
     """One Schwab quote call → (last, prev_close, net_change, net_pct).
     Used by the scanner so we don't burn a second round-trip just to read
-    yesterday's close."""
+    yesterday's close. Also populates _prev_close_cache so the gamma profile
+    endpoint's squeeze score can use the same prev_close without a second call."""
     if client is None:
         raise Exception("Schwab API client not initialized.")
     _count_schwab('quotes')
@@ -17950,9 +19008,16 @@ def _scanner_quote_snapshot(ticker):
     if (net_change is None or net_pct is None) and last is not None and prev_close:
         net_change = float(last) - float(prev_close)
         net_pct = (net_change / float(prev_close)) * 100.0 if prev_close else None
+    pc_float = float(prev_close) if prev_close is not None else None
+    if pc_float is not None:
+        try:
+            with _prev_close_cache_lock:
+                _prev_close_cache[ticker] = (time.time(), pc_float)
+        except NameError:
+            pass  # cache not yet defined (early import order)
     return (
         float(last) if last is not None else None,
-        float(prev_close) if prev_close is not None else None,
+        pc_float,
         float(net_change) if net_change is not None else None,
         float(net_pct) if net_pct is not None else None,
     )
@@ -17996,6 +19061,20 @@ def _scanner_compute_row(ticker, today):
     flip = _gex_zero_crossing(overall_pairs)
     flip_distance_pct = ((flip - S) / S * 100.0) if (flip is not None and S) else None
 
+    # Call wall = highest |GEX| call strike at-or-above spot (matches /gamma_profile).
+    call_wall = None
+    if not ck.empty:
+        ck_above = ck[ck.index >= S]
+        if not ck_above.empty:
+            call_wall = float(ck_above.abs().idxmax())
+
+    gex_total = float(sum(v for _, v in overall_pairs))
+    squeeze = compute_squeeze_score(
+        S=S, prev_close=prev_close, call_wall=call_wall,
+        gex_total=gex_total, gex_magnitude=gex_magnitude,
+        call_volume=call_vol, put_volume=put_vol,
+    )
+
     def _loudest(df):
         if df is None or df.empty or 'volume' not in df.columns:
             return None
@@ -18030,6 +19109,8 @@ def _scanner_compute_row(ticker, today):
         'gex_magnitude': gex_magnitude,
         'gamma_flip': flip,
         'flip_distance_pct': flip_distance_pct,
+        'call_wall': call_wall,
+        'squeeze': squeeze,
         'loudest_call': _loudest(calls),
         'loudest_put': _loudest(puts),
     }
@@ -18360,6 +19441,16 @@ _SCANNER_HTML = """<!doctype html>
   .mute { color: var(--muted); }
   .quote-flash { animation: qflash 0.6s ease-out; }
   @keyframes qflash { from { background: rgba(177,140,242,0.3); } to { background: transparent; } }
+  .sq-chip {
+    display: inline-block; min-width: 28px; padding: 2px 8px;
+    border-radius: 10px; font-weight: 700; font-size: 11px;
+    background: #2a2a2a; color: #888; border: 1px solid transparent;
+  }
+  .sq-watching { background: rgba(255,221,87,0.15); color: #ffd700; border-color: rgba(255,221,87,0.4); }
+  .sq-active   { background: rgba(255,140,0,0.20);  color: #ff9b3c; border-color: rgba(255,140,0,0.5); }
+  .sq-extreme  { background: rgba(248,113,113,0.25); color: #ff5c5c; border-color: rgba(248,113,113,0.6);
+                 animation: sqpulse 1.4s ease-in-out infinite; }
+  @keyframes sqpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(248,113,113,0.6); } 50% { box-shadow: 0 0 0 4px rgba(248,113,113,0); } }
   .empty {
     padding: 40px; text-align: center; color: var(--muted); font-style: italic;
   }
@@ -18444,6 +19535,7 @@ _SCANNER_HTML = """<!doctype html>
     {key:'pc_ratio',    label:'P/C',  type:'num', fmt:v=>v==null?'—':v.toFixed(2)},
     {key:'gex_magnitude',label:'|GEX|', type:'num', fmt:fmtLarge},
     {key:'flip_distance_pct',label:'FlipΔ%', type:'num', fmt:fmtSignedPct},
+    {key:'squeeze', label:'Squeeze', type:'composite', fmt:fmtSqueeze, sortKey:'squeeze.score'},
     {key:'loudest_call', label:'Top Call', type:'composite', fmt:fmtLoudest},
     {key:'loudest_put',  label:'Top Put',  type:'composite', fmt:fmtLoudest},
     {key:'expiry',  label:'Expiry', type:'str'},
@@ -18488,6 +19580,12 @@ _SCANNER_HTML = """<!doctype html>
     const vo = o.vol_oi != null ? ' <span class="mute">'+o.vol_oi.toFixed(1)+'×</span>' : '';
     return Math.round(o.strike) + ' <span class="mute">'+fmtVol(o.volume)+'</span>' + vo;
   }
+  function fmtSqueeze(o) {
+    if (!o || o.score == null) return '—';
+    const lvl = o.level || 'none';
+    const tip = (o.signal_text || []).join(' · ') || 'No squeeze signals';
+    return '<span class="sq-chip sq-' + lvl + '" title="' + escapeHtml(tip) + '">' + o.score + '</span>';
+  }
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
@@ -18531,6 +19629,7 @@ _SCANNER_HTML = """<!doctype html>
   }
   function pickSortValue(r, k) {
     if (k === 'loudest_call' || k === 'loudest_put') return r[k] ? r[k].volume : null;
+    if (k === 'squeeze') return r[k] ? r[k].score : null;
     return r[k];
   }
   function rowHtml(r) {
@@ -18808,6 +19907,143 @@ def _gex_zero_crossing(strike_value_pairs):
     return None
 
 
+# Per-ticker prev_close cache so the squeeze score's momentum signal doesn't
+# require a fresh Schwab quotes call on every /gamma_profile poll.
+_prev_close_cache = {}  # ticker -> (timestamp, prev_close)
+_prev_close_cache_lock = threading.Lock()
+_PREV_CLOSE_TTL_SEC = 300  # 5 minutes
+
+
+def _get_cached_prev_close(ticker):
+    """Return prev_close for ticker, fetching at most once per TTL. None on failure.
+    NOTE: this performs a network call on a cache miss — only call from places
+    where blocking is acceptable (e.g., scanner worker threads)."""
+    if not ticker:
+        return None
+    now = time.time()
+    with _prev_close_cache_lock:
+        cached = _prev_close_cache.get(ticker)
+        if cached and (now - cached[0]) < _PREV_CLOSE_TTL_SEC:
+            return cached[1]
+    pc = None
+    try:
+        _, pc, _, _ = _scanner_quote_snapshot(ticker)
+    except Exception:
+        pc = None
+    with _prev_close_cache_lock:
+        _prev_close_cache[ticker] = (now, pc)
+    return pc
+
+
+_prev_close_inflight = set()  # tickers currently being refreshed in background
+
+
+def _peek_cached_prev_close(ticker):
+    """Non-blocking: return cached prev_close if fresh, else trigger an async
+    refresh and return None immediately. Safe to call from request handlers
+    that must not block on an external API."""
+    if not ticker:
+        return None
+    now = time.time()
+    with _prev_close_cache_lock:
+        cached = _prev_close_cache.get(ticker)
+        if cached and (now - cached[0]) < _PREV_CLOSE_TTL_SEC:
+            return cached[1]
+        if ticker in _prev_close_inflight:
+            return cached[1] if cached else None  # stale value if any, no second fetch
+        _prev_close_inflight.add(ticker)
+
+    def _refresh():
+        try:
+            _get_cached_prev_close(ticker)  # populates cache
+        finally:
+            with _prev_close_cache_lock:
+                _prev_close_inflight.discard(ticker)
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return cached[1] if cached else None  # return stale value if available
+
+
+def compute_squeeze_score(*, S, prev_close, call_wall, gex_total, gex_magnitude,
+                          call_volume, put_volume):
+    """Composite gamma-squeeze score (0–100) derived from four signals,
+    each contributing 0–25 points:
+      1) Call wall proximity / breach
+      2) Negative dealer net GEX (dealers short gamma)
+      3) Call-vs-put volume skew
+      4) Intraday upside momentum
+
+    Returns: {score, level, signals, signal_text}
+    level ∈ {'none','watching','active','extreme'} at thresholds 0/50/70/85.
+    """
+    sigs = {'call_wall': 0, 'negative_gex': 0, 'call_volume': 0, 'momentum': 0}
+    text = []
+
+    # 1. Call Wall proximity (0-25)
+    if call_wall is not None and S and call_wall > 0:
+        diff_pct = (S - call_wall) / call_wall * 100.0
+        if diff_pct >= 0:
+            sigs['call_wall'] = 25
+            text.append(f"Above ${call_wall:g} call wall")
+        elif diff_pct >= -0.5:
+            sigs['call_wall'] = 20
+            text.append(f"Near ${call_wall:g} call wall ({diff_pct:.1f}%)")
+        elif diff_pct >= -1.0:
+            sigs['call_wall'] = 15
+        elif diff_pct >= -2.0:
+            sigs['call_wall'] = 10
+        elif diff_pct >= -5.0:
+            sigs['call_wall'] = 5
+
+    # 2. Negative net dealer GEX (0-25). Normalize by total |GEX| so the
+    # signal works for both index ETFs and small caps.
+    if gex_magnitude and gex_magnitude > 0 and gex_total is not None and gex_total < 0:
+        ratio = abs(gex_total) / gex_magnitude
+        sigs['negative_gex'] = int(min(25, ratio * 50))
+        if sigs['negative_gex'] >= 10:
+            text.append(f"Dealers short γ ({gex_total/1e9:+.1f}B net)")
+
+    # 3. Call/put volume skew (0-25)
+    if put_volume and put_volume > 0:
+        ratio = (call_volume or 0) / put_volume
+        if ratio >= 3.0:
+            sigs['call_volume'] = 25
+            text.append(f"Calls {ratio:.1f}× puts")
+        elif ratio >= 2.0:
+            sigs['call_volume'] = 15
+            text.append(f"Calls {ratio:.1f}× puts")
+        elif ratio >= 1.5:
+            sigs['call_volume'] = 8
+    elif call_volume and call_volume > 0:
+        # Calls present but zero put volume — strong asymmetry.
+        sigs['call_volume'] = 25
+        text.append("Calls dominate (no put volume)")
+
+    # 4. Intraday upside momentum (0-25)
+    if prev_close and S and prev_close > 0:
+        pct = (S - prev_close) / prev_close * 100.0
+        if pct >= 5.0:
+            sigs['momentum'] = 25
+            text.append(f"+{pct:.1f}% day")
+        elif pct >= 3.0:
+            sigs['momentum'] = 15
+            text.append(f"+{pct:.1f}% day")
+        elif pct >= 1.0:
+            sigs['momentum'] = 8
+
+    score = int(sum(sigs.values()))
+    if score >= 85:
+        level = 'extreme'
+    elif score >= 70:
+        level = 'active'
+    elif score >= 50:
+        level = 'watching'
+    else:
+        level = 'none'
+
+    return {'score': score, 'level': level, 'signals': sigs, 'signal_text': text}
+
+
 @app.route('/gamma_profile', methods=['POST'])
 def gamma_profile():
     """Snapshot for the Gamma Profile sidebar: regime label, key levels
@@ -18966,6 +20202,25 @@ def gamma_profile():
 
     levels.sort(key=lambda l: l['price'], reverse=True)
 
+    # Squeeze score for the active ticker. We deliberately do NOT block this
+    # endpoint on a Schwab quotes() call for prev_close — that can hang and
+    # broke the entire gamma profile UI. Use a non-blocking cache lookup;
+    # if cold, kick off a background refresh and skip the momentum signal
+    # for this response (caller will pick it up on next poll).
+    call_wall_price = None
+    for L in levels:
+        if L.get('type') == 'call_wall':
+            call_wall_price = L.get('price')
+            break
+    prev_close_q = _peek_cached_prev_close(ticker)
+    gex_magnitude_total = float(calls['GEX'].abs().sum()) if not calls.empty else 0.0
+    gex_magnitude_total += float(puts['GEX'].abs().sum()) if not puts.empty else 0.0
+    squeeze = compute_squeeze_score(
+        S=float(S), prev_close=prev_close_q, call_wall=call_wall_price,
+        gex_total=gex_total, gex_magnitude=gex_magnitude_total,
+        call_volume=call_vol, put_volume=put_vol,
+    )
+
     return jsonify({
         'as_of': datetime.now().isoformat(timespec='seconds'),
         'ticker': ticker,
@@ -18977,6 +20232,7 @@ def gamma_profile():
         'dex_total': dex_total,
         'regime': {'label': regime_label, 'description': regime_desc, 'gamma_flip': gamma_flip},
         'levels': levels,
+        'squeeze': squeeze,
         'chain': {
             'call_volume': call_vol, 'put_volume': put_vol,
             'call_oi': call_oi, 'put_oi': put_oi,
