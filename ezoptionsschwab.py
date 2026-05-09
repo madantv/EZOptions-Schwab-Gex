@@ -14895,14 +14895,29 @@ def index():
             const requestId = ++latestExpirationsRequestId;
             expirationsLoading = true;
             document.getElementById('expiry-text').textContent = 'Loading expiries...';
-            fetch(`/expirations/${ticker}`)
+            // Watchdog: if the request never resolves (server hung), force-clear
+            // expirationsLoading after 15s so updateData() doesn't get stuck
+            // short-circuiting forever.
+            const ac = new AbortController();
+            const watchdog = setTimeout(() => {
+                try { ac.abort(); } catch (e) {}
+                if (requestId === latestExpirationsRequestId) {
+                    expirationsLoading = false;
+                    document.getElementById('expiry-text').textContent = 'Select expiries';
+                    showError('Expirations request timed out — server may be slow');
+                }
+            }, 15000);
+            fetch(`/expirations/${ticker}`, { signal: ac.signal })
                 .then(response => {
+                    clearTimeout(watchdog);
                     if (!response.ok) throw new Error('Failed to fetch expirations');
                     return response.json();
                 })
                 .then(data => {
                     const activeTicker = document.getElementById('ticker').value;
                     if (requestId !== latestExpirationsRequestId || activeTicker !== ticker) {
+                        // Stale response — newer request is in flight. Don't touch
+                        // expirationsLoading; the newer request's handler owns it.
                         return;
                     }
                     if (data.error) {
@@ -14965,10 +14980,13 @@ def index():
                     updateData();
                 })
                 .catch(error => {
+                    clearTimeout(watchdog);
                     const activeTicker = document.getElementById('ticker').value;
                     if (requestId !== latestExpirationsRequestId || activeTicker !== ticker) {
                         return;
                     }
+                    // AbortError from the watchdog is already handled above; skip dup error toast.
+                    if (error && error.name === 'AbortError') return;
                     expirationsLoading = false;
                     showError('Error loading expirations: ' + error.message);
                 });
@@ -20076,32 +20094,12 @@ def gamma_profile():
     puts = cached.get('puts')
     S = cached.get('S')
 
-    # Cache miss path: pull a fresh chain so the sidebar works even before
-    # the user has run /update for this ticker/expiry combination.
-    if (calls is None or puts is None or S is None) and expiry_dates:
-        try:
-            exposure_metric = data.get('exposure_metric', 'Open Interest')
-            delta_adjusted = bool(data.get('delta_adjusted', False))
-            cin_val = data.get('calculate_in_notional', True)
-            calculate_in_notional = cin_val.lower() == 'true' if isinstance(cin_val, str) else bool(cin_val)
-            if len(expiry_dates) == 1:
-                calls, puts = fetch_options_for_date(
-                    ticker, expiry_dates[0],
-                    exposure_metric=exposure_metric,
-                    delta_adjusted=delta_adjusted,
-                    calculate_in_notional=calculate_in_notional,
-                )
-            else:
-                calls, puts = fetch_options_for_multiple_dates(
-                    ticker, expiry_dates,
-                    exposure_metric=exposure_metric,
-                    delta_adjusted=delta_adjusted,
-                    calculate_in_notional=calculate_in_notional,
-                )
-            S = get_current_price(ticker)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
+    # NOTE: We deliberately DO NOT trigger a fresh option-chain fetch on a
+    # cache miss here. Doing so used to cause Flask thread-pool exhaustion
+    # when many polls (sidebar @5s + banner @60s + dashboard @1s) hit the
+    # endpoint simultaneously while Schwab's chain endpoint was slow.
+    # The dashboard's /update endpoint warms _options_cache every second;
+    # this endpoint just rides that cache.
     if calls is None or puts is None or S is None or (calls.empty and puts.empty):
         return jsonify({'error': 'No options data available — load the dashboard for this ticker first'}), 404
 
